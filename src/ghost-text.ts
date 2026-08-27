@@ -214,6 +214,11 @@ function nextSegmentLength(text: string): number {
 }
 
 const managers = new WeakMap<EditorView, SuggestionManager>();
+const activeManagers = new Set<SuggestionManager>();
+
+export function clearAllSuggestions(): void {
+  for (const manager of activeManagers) manager.clear();
+}
 
 export function getSuggestionManager(
   view: EditorView
@@ -234,6 +239,7 @@ export class SuggestionManager {
     private readonly getConfig: GetConfig
   ) {
     managers.set(view, this);
+    activeManagers.add(this);
   }
 
   update(update: ViewUpdate): void {
@@ -319,6 +325,8 @@ export class SuggestionManager {
     const snapshot = this.compositionSnapshot;
     this.compositionSnapshot = null;
 
+    if (!this.getConfig().enabled) return;
+
     if (snapshot) {
       const doc = this.view.state.doc.toString();
       const { before, after, suggestion } = snapshot;
@@ -388,7 +396,8 @@ export class SuggestionManager {
         signal: controller.signal,
       });
 
-      if (controller.signal.aborted || !result) return;
+      if (controller.signal.aborted || !result || !result.trim()) return;
+      if (!this.getConfig().enabled) return;
       if (this.view.state.doc !== doc) return;
 
       const currentSelection = this.view.state.selection.main;
@@ -401,14 +410,21 @@ export class SuggestionManager {
     }
   }
 
-  destroy(): void {
+  clear(): void {
     this.cancelTimer();
     this.abortRequest();
+    this.compositionSnapshot = null;
+    if (currentSuggestion(this.view)) setSuggestion(this.view, null);
+  }
+
+  destroy(): void {
+    this.clear();
     if (this.compositionFinishTimer !== null) {
       window.clearTimeout(this.compositionFinishTimer);
       this.compositionFinishTimer = null;
     }
     managers.delete(this.view);
+    activeManagers.delete(this);
   }
 
   private cancelTimer(): void {
