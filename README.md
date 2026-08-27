@@ -1,105 +1,106 @@
 # AI Autocomplete
 
-A lightweight inline AI completion plugin for Obsidian. It renders Copilot-style ghost text directly at the cursor and uses `@earendil-works/pi-ai` for model/provider request handling.
+A focused AI writing assistant for Obsidian: Copilot-style inline completion plus an optional linked discussion sidebar. Provider/model handling is delegated to `@earendil-works/pi-ai`.
 
-## Writing completion
+## Inline completion
 
-Pause briefly while typing and a muted suggestion appears inline.
+Pause briefly while typing and a muted suggestion appears at the cursor.
 
 - **Tab** accepts the whole suggestion.
 - **Esc** dismisses it.
 - **Cmd/Ctrl + Right Arrow** accepts the next word/segment.
-- If you keep typing text that matches the suggestion, the matching prefix is consumed and only the remaining ghost text stays visible.
-- Chinese/Japanese/Korean IME composition is handled separately so the ghost does not fight the operating system's composition range.
+- Continuing to type a matching prefix consumes that part of the ghost text instead of dismissing it.
+- Chinese/Japanese/Korean IME composition is handled separately.
+- Prefix + suffix context is sent as a fill-in-the-middle style prompt.
 
-Automatic completion can be turned off without disabling manual completion. Use the Obsidian command **AI Autocomplete: Trigger inline suggestion** and assign any shortcut from **Settings → Hotkeys**.
+Automatic completion can be disabled without disabling manual completion. Bind **AI Autocomplete: Trigger inline suggestion** from Obsidian **Settings → Hotkeys**.
 
-Writing completion is deliberately stateless. Each completion request only uses the current note context around the cursor; discussion history is never included.
+Inline completion is deliberately stateless. Discussion history is never included in completion requests.
 
 ## Eagerness
 
 Automatic completion has a 1–5 eagerness setting:
 
-- **1** — conservative: waits longer and requires more context.
-- **3** — balanced default.
-- **5** — eager: triggers quickly with very little preceding text.
+- **1** — conservative
+- **3** — balanced default
+- **5** — eager
 
-Eagerness only changes automatic trigger timing and minimum-context thresholds. It does not change model generation parameters, and manual trigger bypasses the automatic threshold.
+Eagerness changes automatic trigger delay and minimum context only. Manual trigger bypasses the automatic threshold.
 
-## Lightweight discussion
+## Discussion sidebar
 
-Select a question or passage and run **AI Autocomplete: Ask / continue discussion about selection**. The answer appears as a lightweight block-style ghost below the selected line.
+Discussion is intentionally separate from inline completion.
 
-- **Tab** accepts the answer into the note.
-- **Esc** hides the answer without clearing the discussion history.
-- Select another question and run the same command to continue the discussion.
-- **Start new discussion for current note** clears the current note's discussion history.
+Select a passage in a Markdown note and run **AI Autocomplete: Discuss selection in sidebar**. The right sidebar opens and pins the selected passage as reference context. The selection is not sent as a question automatically; type the actual question in the sidebar.
 
-Discussion keeps a short Q/A history per note for the current Obsidian session. It is kept in memory only: it is not written into the Vault and is cleared when the plugin/app reloads.
+The sidebar provides:
 
-## Provider setup
+- pinned reference text from the editor
+- per-note short discussion history
+- a normal multi-line question box
+- immediate **Thinking… / Generating…** status
+- streaming answer updates on supported desktop transports
+- **Stop** while a response is running; received partial text is kept
+- **New** to clear the current note's discussion
+- **Use selection** to replace the pinned reference with the latest editor selection
+- **Clear** to remove the pinned reference
 
-The plugin delegates Chat Completions parsing, streaming events, text/thinking separation, and provider compatibility behavior to **pi-ai**. The current UI exposes one configurable OpenAI-compatible pi-ai provider:
+Moving the editor cursor, changing selection, or clicking elsewhere does not dismiss the sidebar answer. Discussion state is kept in memory for the current Obsidian session and is not written into the Vault.
 
-- **API base URL** — for example `https://api.openai.com/v1` or `http://127.0.0.1:18180/v1`.
-- **API key** — used by pi-ai/OpenAI transport. A placeholder is used for keyless local endpoints.
-- **Model** — the exact model id accepted by the endpoint.
+## Providers and models
 
-Obsidian `requestUrl` is used as pi-ai's HTTP transport so desktop plugins can still reach local/custom endpoints without normal browser CORS restrictions. Response parsing itself is handled by pi-ai.
+The settings page exposes pi-ai providers directly. Built-in providers currently include common choices such as OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, xAI, DeepSeek, Cerebras, Mistral, Z.AI, Moonshot AI, MiniMax, and Together AI.
 
-## Reasoning
+For a built-in provider:
 
-Completion and discussion have separate reasoning settings:
+1. choose **Provider**
+2. enter that provider's API key
+3. choose **Model** from the pi-ai catalog
 
-- **Provider default (do not send)** — no reasoning level is requested from pi-ai, so the provider-specific reasoning field is omitted.
-- **None** — explicitly maps to the provider value `none`.
-- **Low / Medium / High** — asks pi-ai for the corresponding normalized thinking level.
+Each provider remembers its own API key and model selection.
 
-pi-ai keeps thinking blocks separate from answer text. The plugin only renders `text` blocks; it never uses internal thinking/reasoning content as a completion fallback.
+Choose **Custom OpenAI-compatible** only for a custom/local endpoint. That mode exposes **API base URL** and a free-form **Model** field, so endpoints such as `http://127.0.0.1:18180/v1` remain supported.
 
-If a model consumes its full output budget on thinking and returns no text, the plugin reports that condition and suggests using Provider default/None or increasing the token budget.
+pi-ai owns provider-specific request formatting, streaming parsing, model metadata, and text/thinking separation. Internal thinking blocks are never used as note completion text.
+
+## Reasoning and token budget
+
+Completion and discussion have separate reasoning controls:
+
+- **Provider default (do not send)** — no explicit reasoning level is requested
+- **Minimal / None (provider-specific)**
+- **Low**
+- **Medium**
+- **High**
+
+Reasoning models may spend a large part of the output budget before producing answer text. Both completion and discussion token budgets are direct numeric inputs accepting **16–65,536** tokens instead of a narrow slider.
+
+If a model reaches the output limit while still reasoning and returns no answer text, the plugin reports that condition instead of exposing internal reasoning as the answer.
 
 ## Completion prompt templates
 
-Completion prompt templates only contain a name and a system prompt. Provider/model settings stay global.
+Completion templates contain only a name and a system prompt. Provider/model settings remain global.
 
-The settings page supports:
+The settings page supports selecting, creating, duplicating, renaming, deleting, editing, and resetting templates. Discussion has a separate editable system prompt.
 
-- selecting the active template
-- creating a new template
-- duplicating a template
-- renaming a template
-- deleting a template
-- editing the full system prompt
-- resetting the current prompt to the built-in default
+## Default completion context
 
-Discussion uses a separate editable system prompt so chat-style instructions do not interfere with inline completion behavior.
+Each completion request includes up to:
 
-## Completion behavior
+- 2400 characters before the cursor
+- 600 characters after the cursor
 
-The plugin sends a fill-in-the-middle style prompt containing text before and after the cursor. The provider itself does not need a native FIM API.
-
-Default context window sent per request:
-
-- up to 2400 characters before the cursor
-- up to 600 characters after the cursor
-
-Results are only displayed when the document and cursor are still at the position that initiated the request, so stale completions cannot overwrite newer typing.
-
-Normal model output is not trimmed before insertion. Leading spaces and newlines are preserved because they may be required for correct inline completion.
+Stale requests are ignored when the document/cursor no longer matches the initiating state. Normal model output is not trimmed before insertion because leading spaces/newlines can be meaningful.
 
 ## Commands
-
-The command palette exposes:
 
 - Trigger inline suggestion
 - Accept inline suggestion
 - Accept next suggestion segment
 - Dismiss inline suggestion
-- Ask / continue discussion about selection
+- Open AI discussion sidebar
+- Discuss selection in sidebar
 - Start new discussion for current note
-- Accept discussion answer
-- Dismiss discussion answer
 - Toggle automatic completion
 - Test provider connection
 
@@ -112,7 +113,7 @@ npm install
 npm run build
 ```
 
-`npm run build` runs TypeScript typechecking before producing the production bundle. GitHub Actions runs the same build on the development branch and pull requests.
+`npm run build` runs TypeScript typechecking before producing the production bundle. GitHub Actions builds an installable Obsidian artifact on the development branch and pull requests.
 
 ## License
 
