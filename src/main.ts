@@ -11,6 +11,7 @@ import type { Extension } from "@codemirror/state";
 import {
   acceptSuggestion,
   acceptSuggestionSegment,
+  clearAllSuggestions,
   dismissSuggestion,
   getSuggestionManager,
   inlineSuggestionExtension,
@@ -117,6 +118,7 @@ export default class AIAutocompletePlugin extends Plugin {
       name: "Toggle auto-completion",
       callback: () => {
         this.settings.enabled = !this.settings.enabled;
+        if (!this.settings.enabled) clearAllSuggestions();
         void this.saveSettings();
         new Notice(
           `AI autocomplete: ${this.settings.enabled ? "on" : "off"}`
@@ -213,6 +215,7 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(settings.enabled).onChange(async (value) => {
           settings.enabled = value;
+          if (!value) clearAllSuggestions();
           await this.plugin.saveSettings();
         })
       );
