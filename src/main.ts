@@ -1,44 +1,55 @@
-import { Plugin, PluginSettingTab, App, Setting, Notice } from "obsidian";
-import { Extension } from "@codemirror/state";
-import { inlineSuggestionExtension } from "./ghost-text";
+import {
+  App,
+  Editor,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+} from "obsidian";
+import type { EditorView } from "@codemirror/view";
+import type { Extension } from "@codemirror/state";
+import {
+  acceptSuggestion,
+  acceptSuggestionSegment,
+  dismissSuggestion,
+  getSuggestionManager,
+  inlineSuggestionExtension,
+  type InlineSuggestionConfig,
+} from "./ghost-text";
 import {
   CompletionError,
-  CompletionRequestOptions,
+  type CompletionRequestOptions,
+  DEFAULT_API_BASE_URL,
   DEFAULT_SYSTEM_PROMPT,
   fetchCompletion,
-  OPENROUTER_API_URL,
-} from "./groq-api";
+} from "./openai-client";
 
 interface AIAutocompleteSettings {
+  enabled: boolean;
   apiKey: string;
   model: string;
   baseUrl: string;
   systemPrompt: string;
-  reasoningEffort: string;
-  excludeReasoning: boolean;
-  providerOnly: string;
-  providerSort: string;
-  allowFallbacks: boolean;
-  httpReferer: string;
-  appTitle: string;
+  temperature: number;
+  maxTokens: number;
   delay: number;
-  enabled: boolean;
+  minPrefixChars: number;
+  maxPrefixChars: number;
+  maxSuffixChars: number;
 }
 
 const DEFAULT_SETTINGS: AIAutocompleteSettings = {
-  apiKey: "",
-  model: "openai/gpt-oss-120b:nitro",
-  baseUrl: OPENROUTER_API_URL,
-  systemPrompt: DEFAULT_SYSTEM_PROMPT,
-  reasoningEffort: "minimal",
-  excludeReasoning: true,
-  providerOnly: "groq",
-  providerSort: "throughput",
-  allowFallbacks: false,
-  httpReferer: "https://github.com/Leoyishou/obsidian-ai-autocomplete",
-  appTitle: "AI Autocomplete",
-  delay: 800,
   enabled: true,
+  apiKey: "",
+  model: "gpt-4o-mini",
+  baseUrl: DEFAULT_API_BASE_URL,
+  systemPrompt: DEFAULT_SYSTEM_PROMPT,
+  temperature: 0.2,
+  maxTokens: 96,
+  delay: 650,
+  minPrefixChars: 3,
+  maxPrefixChars: 2400,
+  maxSuffixChars: 600,
 };
 
 export default class AIAutocompletePlugin extends Plugin {
@@ -46,27 +57,60 @@ export default class AIAutocompletePlugin extends Plugin {
   private editorExtensions: Extension[] = [];
   private lastErrorNoticeAt = 0;
 
-  async onload() {
+  async onload(): Promise<void> {
     await this.loadSettings();
 
     this.editorExtensions = inlineSuggestionExtension(
-      async (prefix, suffix) => {
-        if (!this.settings.enabled || !this.settings.apiKey) return null;
+      async ({ prefix, suffix, signal }) => {
+        if (!this.settings.enabled) return null;
         try {
           return await fetchCompletion(
             this.getCompletionOptions(),
             prefix,
-            suffix
+            suffix,
+            signal
           );
-        } catch (e) {
-          this.showCompletionError(e);
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") return null;
+          this.showCompletionError(error);
           return null;
         }
       },
-      this.settings.delay
+      () => this.getInlineConfig()
     );
 
     this.registerEditorExtension(this.editorExtensions);
+    this.addSettingTab(new AIAutocompleteSettingTab(this.app, this));
+    this.registerCommands();
+  }
+
+  private registerCommands(): void {
+    this.addCommand({
+      id: "trigger",
+      name: "Trigger inline suggestion",
+      editorCallback: (editor) => {
+        const view = cmOf(editor);
+        if (view) void getSuggestionManager(view)?.request();
+      },
+    });
+
+    this.addCommand({
+      id: "accept",
+      name: "Accept inline suggestion",
+      editorCallback: (editor) => withView(editor, acceptSuggestion),
+    });
+
+    this.addCommand({
+      id: "accept-segment",
+      name: "Accept next suggestion segment",
+      editorCallback: (editor) => withView(editor, acceptSuggestionSegment),
+    });
+
+    this.addCommand({
+      id: "dismiss",
+      name: "Dismiss inline suggestion",
+      editorCallback: (editor) => withView(editor, dismissSuggestion),
+    });
 
     this.addCommand({
       id: "toggle",
@@ -82,25 +126,31 @@ export default class AIAutocompletePlugin extends Plugin {
 
     this.addCommand({
       id: "test-connection",
-      name: "Test connection",
-      callback: () => {
-        void this.testConnection();
-      },
+      name: "Test provider connection",
+      callback: () => void this.testConnection(),
     });
-
-    this.addSettingTab(new AIAutocompleteSettingTab(this.app, this));
   }
 
-  async loadSettings() {
+  async loadSettings(): Promise<void> {
     this.settings = Object.assign(
       {},
       DEFAULT_SETTINGS,
-      await this.loadData()
+      (await this.loadData()) as Partial<AIAutocompleteSettings>
     );
   }
 
-  async saveSettings() {
+  async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  getInlineConfig(): InlineSuggestionConfig {
+    return {
+      enabled: this.settings.enabled,
+      delay: this.settings.delay,
+      minPrefixChars: this.settings.minPrefixChars,
+      maxPrefixChars: this.settings.maxPrefixChars,
+      maxSuffixChars: this.settings.maxSuffixChars,
+    };
   }
 
   getCompletionOptions(): CompletionRequestOptions {
@@ -109,35 +159,30 @@ export default class AIAutocompletePlugin extends Plugin {
       model: this.settings.model,
       baseUrl: this.settings.baseUrl,
       systemPrompt: this.settings.systemPrompt,
-      reasoningEffort: this.settings.reasoningEffort,
-      excludeReasoning: this.settings.excludeReasoning,
-      providerOnly: this.settings.providerOnly,
-      providerSort: this.settings.providerSort,
-      allowFallbacks: this.settings.allowFallbacks,
-      httpReferer: this.settings.httpReferer,
-      appTitle: this.settings.appTitle,
+      temperature: this.settings.temperature,
+      maxTokens: this.settings.maxTokens,
     };
   }
 
-  async testConnection() {
-    if (!this.settings.apiKey) {
-      new Notice("AI autocomplete: API key is empty");
-      return;
-    }
-
+  async testConnection(): Promise<void> {
+    const controller = new AbortController();
     try {
       const result = await fetchCompletion(
         this.getCompletionOptions(),
-        "个人知识笔记的真正价值在于",
-        ""
+        "个人知识笔记的价值在于",
+        "，而不仅仅是把信息保存下来。",
+        controller.signal
       );
-      new Notice(`AI autocomplete: connected${result ? ` (${result})` : ""}`);
-    } catch (e) {
-      this.showCompletionError(e, true);
+      const sample = result?.replace(/\s+/g, " ").slice(0, 50);
+      new Notice(
+        `AI autocomplete: connected${sample ? ` — ${sample}` : ""}`
+      );
+    } catch (error) {
+      this.showCompletionError(error, true);
     }
   }
 
-  showCompletionError(error: unknown, forceNotice = false) {
+  showCompletionError(error: unknown, forceNotice = false): void {
     console.error("AI autocomplete: completion error", error);
 
     const now = Date.now();
@@ -153,243 +198,156 @@ export default class AIAutocompletePlugin extends Plugin {
 }
 
 class AIAutocompleteSettingTab extends PluginSettingTab {
-  plugin: AIAutocompletePlugin;
-
-  constructor(app: App, plugin: AIAutocompletePlugin) {
+  constructor(app: App, private readonly plugin: AIAutocompletePlugin) {
     super(app, plugin);
-    this.plugin = plugin;
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-
-    new Setting(containerEl)
-      .setName("API key")
-      .setDesc("Use this key for the default provider route")
-      .addText((text) =>
-        text
-          .setPlaceholder("Enter your API key")
-          .setValue(this.plugin.settings.apiKey)
-          .onChange(async (value) => {
-            this.plugin.settings.apiKey = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("API base URL")
-      .setDesc("Chat completions endpoint")
-      .addText((text) =>
-        text
-          .setPlaceholder(OPENROUTER_API_URL)
-          .setValue(this.plugin.settings.baseUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.baseUrl = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    const modelOptions: Record<string, string> = {
-      "openai/gpt-oss-120b:nitro":
-        "OpenAI GPT OSS 120B via Groq (smartest)",
-      "meta-llama/llama-3.3-70b-instruct:nitro":
-        "Llama 3.3 70B via Groq (stable)",
-      "moonshotai/kimi-k2-0905:nitro":
-        "Kimi K2 0905 via Groq (code/long context)",
-      "qwen/qwen3-32b:nitro": "Qwen3 32B via Groq (Chinese/reasoning)",
-      "meta-llama/llama-3.1-8b-instruct:nitro":
-        "Llama 3.1 8B via Groq (lowest latency)",
-      "openai/gpt-oss-20b:nitro": "OpenAI GPT OSS 20B via Groq (reasoning)",
-      "llama-3.3-70b-versatile": "Groq direct: Llama 3.3 70B",
-      "openai/gpt-oss-120b": "Groq direct: GPT OSS 120B",
-    };
-
-    new Setting(containerEl)
-      .setName("Model")
-      .setDesc("Model slug")
-      .addDropdown((dropdown) => {
-        for (const [value, label] of Object.entries(modelOptions)) {
-          dropdown.addOption(value, label);
-        }
-        if (!modelOptions[this.plugin.settings.model]) {
-          dropdown.addOption(this.plugin.settings.model, "Custom current model");
-        }
-        return dropdown
-          .setValue(this.plugin.settings.model)
-          .onChange(async (value) => {
-            this.plugin.settings.model = value;
-            await this.plugin.saveSettings();
-            this.display();
-          });
-      })
-      .addText((text) =>
-        text
-          .setPlaceholder("Enter a model slug")
-          .setValue(this.plugin.settings.model)
-          .onChange(async (value) => {
-            this.plugin.settings.model = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Reasoning effort")
-      .setDesc("Use minimal/low for inline autocomplete to keep responses fast")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("minimal", "Minimal")
-          .addOption("low", "Low")
-          .addOption("medium", "Medium")
-          .addOption("high", "High")
-          .addOption("none", "None")
-          .addOption("", "API default")
-          .setValue(this.plugin.settings.reasoningEffort)
-          .onChange(async (value) => {
-            this.plugin.settings.reasoningEffort = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Hide reasoning")
-      .setDesc("Keep reasoning tokens out of the returned suggestion text")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.excludeReasoning)
-          .onChange(async (value) => {
-            this.plugin.settings.excludeReasoning = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("System prompt")
-      .setDesc("Controls the writing style and insight behavior of ghost text")
-      .addTextArea((text) => {
-        text.inputEl.rows = 14;
-        text.inputEl.cols = 64;
-        text
-          .setPlaceholder(DEFAULT_SYSTEM_PROMPT)
-          .setValue(this.plugin.settings.systemPrompt)
-          .onChange(async (value) => {
-            this.plugin.settings.systemPrompt = value;
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName("Reset prompt")
-      .setDesc("Restore the built-in heuristic prompt")
-      .addButton((button) =>
-        button.setButtonText("Reset").onClick(async () => {
-          this.plugin.settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
-          await this.plugin.saveSettings();
-          this.display();
-          new Notice("AI autocomplete: prompt reset");
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Provider")
-      .setDesc("Use groq as the only provider")
-      .addText((text) =>
-        text
-          .setPlaceholder("Provider name")
-          .setValue(this.plugin.settings.providerOnly)
-          .onChange(async (value) => {
-            this.plugin.settings.providerOnly = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Provider sort")
-      .setDesc("Throughput prioritizes speed")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("throughput", "Throughput")
-          .addOption("latency", "Latency")
-          .addOption("price", "Price")
-          .addOption("", "Default")
-          .setValue(this.plugin.settings.providerSort)
-          .onChange(async (value) => {
-            this.plugin.settings.providerSort = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Allow fallbacks")
-      .setDesc("Off means only use the selected provider")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.allowFallbacks)
-          .onChange(async (value) => {
-            this.plugin.settings.allowFallbacks = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("HTTP referer")
-      .setDesc("Optional app attribution")
-      .addText((text) =>
-        text
-          .setPlaceholder("Enter a referer URL")
-          .setValue(this.plugin.settings.httpReferer)
-          .onChange(async (value) => {
-            this.plugin.settings.httpReferer = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("App title")
-      .setDesc("Optional app attribution")
-      .addText((text) =>
-        text
-          .setPlaceholder("AI autocomplete")
-          .setValue(this.plugin.settings.appTitle)
-          .onChange(async (value) => {
-            this.plugin.settings.appTitle = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Trigger delay (ms)")
-      .setDesc("How long to wait after typing before triggering completion")
-      .addSlider((slider) =>
-        slider
-          .setLimits(300, 2000, 100)
-          .setValue(this.plugin.settings.delay)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.delay = value;
-            await this.plugin.saveSettings();
-          })
-      );
+    const settings = this.plugin.settings;
 
     new Setting(containerEl)
       .setName("Enabled")
-      .setDesc("Toggle auto-completion on/off")
+      .setDesc("Show inline suggestions automatically while typing.")
       .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.enabled)
+        toggle.setValue(settings.enabled).onChange(async (value) => {
+          settings.enabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl).setName("Provider").setHeading();
+
+    new Setting(containerEl)
+      .setName("API base URL")
+      .setDesc(
+        "OpenAI-compatible API root, for example https://api.openai.com/v1. /chat/completions is appended automatically."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_API_BASE_URL)
+          .setValue(settings.baseUrl)
           .onChange(async (value) => {
-            this.plugin.settings.enabled = value;
+            settings.baseUrl = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("API key")
+      .setDesc("Optional for local providers that do not require authentication.")
+      .addText((text) => {
+        text
+          .setPlaceholder("sk-…")
+          .setValue(settings.apiKey)
+          .onChange(async (value) => {
+            settings.apiKey = value.trim();
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = "password";
+      });
+
+    new Setting(containerEl)
+      .setName("Model")
+      .setDesc("Exact model name accepted by your provider.")
+      .addText((text) =>
+        text
+          .setPlaceholder("gpt-4o-mini")
+          .setValue(settings.model)
+          .onChange(async (value) => {
+            settings.model = value.trim();
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
       .setName("Connection")
-      .setDesc("Send a short test request with the current settings")
+      .setDesc("Send a small completion request using the current settings.")
       .addButton((button) =>
-        button.setButtonText("Test").onClick(() => {
-          void this.plugin.testConnection();
+        button.setButtonText("Test").onClick(() => void this.plugin.testConnection())
+      );
+
+    new Setting(containerEl).setName("Completion").setHeading();
+
+    new Setting(containerEl)
+      .setName("Trigger delay")
+      .setDesc("Idle time after typing before requesting a suggestion.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(200, 2000, 50)
+          .setValue(settings.delay)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            settings.delay = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Maximum tokens")
+      .setDesc("Keep this low for fast, concise inline suggestions.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(32, 256, 16)
+          .setValue(settings.maxTokens)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            settings.maxTokens = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Temperature")
+      .setDesc("Lower values make completions more stable and predictable.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0, 1, 0.1)
+          .setValue(settings.temperature)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            settings.temperature = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("System prompt")
+      .setDesc("Instructions used for every inline completion request.")
+      .addTextArea((text) => {
+        text.inputEl.rows = 12;
+        text.inputEl.cols = 60;
+        text
+          .setPlaceholder(DEFAULT_SYSTEM_PROMPT)
+          .setValue(settings.systemPrompt)
+          .onChange(async (value) => {
+            settings.systemPrompt = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Reset prompt")
+      .setDesc("Restore the built-in inline-completion prompt.")
+      .addButton((button) =>
+        button.setButtonText("Reset").onClick(async () => {
+          settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+          await this.plugin.saveSettings();
+          this.display();
         })
       );
   }
+}
+
+function cmOf(editor: Editor): EditorView | null {
+  return (editor as unknown as { cm?: EditorView }).cm ?? null;
+}
+
+function withView(
+  editor: Editor,
+  action: (view: EditorView) => boolean
+): void {
+  const view = cmOf(editor);
+  if (view) action(view);
 }
