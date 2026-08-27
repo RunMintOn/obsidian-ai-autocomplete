@@ -1,4 +1,13 @@
 import { requestUrl } from "obsidian";
+import {
+  contentText,
+  createProvider,
+  type AssistantMessage,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
 export const DEFAULT_API_BASE_URL = "https://api.openai.com/v1";
 export const NO_SUGGESTION = "NO_SUGGESTION";
@@ -51,11 +60,13 @@ export class CompletionError extends Error {
   }
 }
 
-export function normalizeChatCompletionsUrl(baseUrl: string): string {
-  const trimmed = (baseUrl.trim() || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
-  if (trimmed.endsWith("/chat/completions")) return trimmed;
-  return `${trimmed}/chat/completions`;
-}
+type Runtime = {
+  key: string;
+  provider: ReturnType<typeof createProvider<"openai-completions">>;
+  model: Model<"openai-completions">;
+};
+
+let cachedRuntime: Runtime | null = null;
 
 function abortError(): Error {
   const error = new Error("Completion request aborted");
@@ -63,19 +74,217 @@ function abortError(): Error {
   return error;
 }
 
-function extractMessageContent(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
+function normalizeApiRoot(baseUrl: string): string {
+  const trimmed = (baseUrl.trim() || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
+  const suffix = "/chat/completions";
+  return trimmed.endsWith(suffix) ? trimmed.slice(0, -suffix.length) : trimmed;
+}
 
-  const parts = content
-    .map((part) => {
-      if (!part || typeof part !== "object") return "";
-      const value = (part as { text?: unknown }).text;
-      return typeof value === "string" ? value : "";
-    })
-    .join("");
+function runtimeFor(options: CompletionRequestOptions): Runtime {
+  const modelId = options.model.trim();
+  if (!modelId) throw new CompletionError("Model is empty");
 
-  return parts || null;
+  const baseUrl = normalizeApiRoot(options.baseUrl);
+  const key = `${baseUrl}\u0000${modelId}`;
+  if (cachedRuntime?.key === key) return cachedRuntime;
+
+  const model: Model<"openai-completions"> = {
+    id: modelId,
+    name: modelId,
+    api: "openai-completions",
+    provider: "ai-autocomplete-custom",
+    baseUrl,
+    reasoning: true,
+    // pi-ai uses its own normalized thinking levels. We map the UI's explicit
+    // "none" choice onto `minimal`, which the provider then serializes as
+    // reasoning_effort="none". Leaving reasoning undefined sends no field.
+    thinkingLevelMap: {
+      minimal: "none",
+      low: "low",
+      medium: "medium",
+      high: "high",
+    },
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 131072,
+    maxTokens: 32768,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
+      maxTokensField: "max_tokens",
+      thinkingFormat: "openai",
+    },
+  };
+
+  const provider = createProvider({
+    id: "ai-autocomplete-custom",
+    name: "AI Autocomplete custom provider",
+    baseUrl,
+    auth: {
+      apiKey: {
+        name: "API key",
+        async resolve() {
+          return undefined;
+        },
+      },
+    },
+    models: [model],
+    api: openAICompletionsApi(),
+  });
+
+  cachedRuntime = { key, provider, model };
+  return cachedRuntime;
+}
+
+function toPiReasoning(
+  effort: ReasoningEffort | undefined
+): SimpleStreamOptions["reasoning"] | undefined {
+  if (!effort) return undefined;
+  if (effort === "none") return "minimal";
+  return effort;
+}
+
+function syntheticAssistantMessage(
+  text: string,
+  model: Model<"openai-completions">
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+function buildContext(
+  messages: ChatMessage[],
+  model: Model<"openai-completions">
+): Context {
+  const systemPrompt = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n\n");
+
+  const contextMessages: Context["messages"] = [];
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "user") {
+      contextMessages.push({
+        role: "user",
+        content: message.content,
+        timestamp: Date.now(),
+      });
+    } else {
+      contextMessages.push(syntheticAssistantMessage(message.content, model));
+    }
+  }
+
+  return {
+    systemPrompt: systemPrompt || undefined,
+    messages: contextMessages,
+  };
+}
+
+async function obsidianFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
+  const request = input instanceof Request ? input : null;
+  const url =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url;
+
+  const signal = init?.signal ?? request?.signal;
+  if (signal?.aborted) throw abortError();
+
+  const headers = new Headers(request?.headers);
+  if (init?.headers) {
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  }
+
+  let body: string | ArrayBuffer | undefined;
+  const suppliedBody = init?.body;
+  if (typeof suppliedBody === "string") {
+    body = suppliedBody;
+  } else if (suppliedBody instanceof ArrayBuffer) {
+    body = suppliedBody;
+  } else if (ArrayBuffer.isView(suppliedBody)) {
+    body = suppliedBody.buffer.slice(
+      suppliedBody.byteOffset,
+      suppliedBody.byteOffset + suppliedBody.byteLength
+    );
+  } else if (!suppliedBody && request && !["GET", "HEAD"].includes(request.method)) {
+    body = await request.clone().arrayBuffer();
+  } else if (suppliedBody != null) {
+    throw new CompletionError("Unsupported request body from pi-ai transport");
+  }
+
+  const requestPromise = requestUrl({
+    url,
+    method: init?.method ?? request?.method ?? "GET",
+    headers: Object.fromEntries(headers.entries()),
+    body,
+    throw: false,
+  });
+
+  const response = signal
+    ? await new Promise<Awaited<ReturnType<typeof requestUrl>>>((resolve, reject) => {
+        const onAbort = () => reject(abortError());
+        signal.addEventListener("abort", onAbort, { once: true });
+        requestPromise.then(
+          (value) => {
+            signal.removeEventListener("abort", onAbort);
+            resolve(value);
+          },
+          (error) => {
+            signal.removeEventListener("abort", onAbort);
+            reject(error);
+          }
+        );
+      })
+    : await requestPromise;
+
+  if (signal?.aborted) throw abortError();
+
+  return new Response(response.arrayBuffer, {
+    status: response.status,
+    headers: response.headers,
+  });
+}
+
+function extractTextOrThrow(message: AssistantMessage): string | null {
+  if (message.stopReason === "aborted") throw abortError();
+  if (message.stopReason === "error") {
+    throw new CompletionError(message.errorMessage || "Provider request failed");
+  }
+
+  const text = contentText(message.content, "");
+  if (text) return text;
+
+  const hasThinking = message.content.some(
+    (block) => block.type === "thinking" && block.thinking.trim().length > 0
+  );
+  if (hasThinking && message.stopReason === "length") {
+    throw new CompletionError(
+      "The model used the output budget for reasoning and returned no answer text. Set reasoning to Provider default/None or increase the token budget."
+    );
+  }
+
+  return null;
 }
 
 function normalizeCompletion(text: string): string | null {
@@ -97,51 +306,29 @@ export async function fetchChatCompletion(
   signal: AbortSignal
 ): Promise<string | null> {
   if (signal.aborted) throw abortError();
-  if (!options.model.trim()) {
-    throw new CompletionError("Model is empty");
-  }
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (options.apiKey.trim()) {
-    headers.Authorization = `Bearer ${options.apiKey.trim()}`;
-  }
-
-  const reasoningEffort = options.reasoningEffort?.trim();
 
   try {
-    const response = await requestUrl({
-      url: normalizeChatCompletionsUrl(options.baseUrl),
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: options.model.trim(),
-        messages,
-        max_tokens: options.maxTokens,
-        temperature: options.temperature,
-        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-      }),
-      throw: false,
-    });
+    const { provider, model } = runtimeFor(options);
+    const requestOptions: SimpleStreamOptions = {
+      apiKey: options.apiKey.trim() || "unused",
+      signal,
+      temperature: options.temperature,
+      maxTokens: options.maxTokens,
+      maxRetries: 0,
+      fetch: obsidianFetch,
+    };
 
+    const reasoning = toPiReasoning(options.reasoningEffort);
+    if (reasoning) requestOptions.reasoning = reasoning;
+
+    const stream = provider.streamSimple(
+      model,
+      buildContext(messages, model),
+      requestOptions
+    );
+    const result = await stream.result();
     if (signal.aborted) throw abortError();
-
-    if (response.status >= 400) {
-      const apiMessage = response.json?.error?.message;
-      throw new CompletionError(
-        typeof apiMessage === "string"
-          ? apiMessage
-          : `HTTP ${response.status}: ${response.text.slice(0, 200)}`
-      );
-    }
-
-    const data = response.json;
-    if (data?.error?.message) {
-      throw new CompletionError(String(data.error.message));
-    }
-
-    return extractMessageContent(data?.choices?.[0]?.message?.content);
+    return extractTextOrThrow(result);
   } catch (error) {
     if (error instanceof CompletionError) throw error;
     if (error instanceof Error) {
