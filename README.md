@@ -108,7 +108,7 @@ The command palette exposes:
 Requires Node 22.
 
 ```bash
-npm ci
+npm install
 npm run build
 ```
 
