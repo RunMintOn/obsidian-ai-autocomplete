@@ -4,6 +4,8 @@ import {
   type ReasoningEffort,
 } from "./ai-client";
 
+export type UiLanguage = "zh" | "en";
+
 export interface PromptTemplate {
   id: string;
   name: string;
@@ -11,11 +13,13 @@ export interface PromptTemplate {
 }
 
 export interface AIAutocompleteSettings {
+  uiLanguage: UiLanguage;
   autoEnabled: boolean;
   eagerness: number;
   providerId: string;
   providerApiKeys: Record<string, string>;
   providerModels: Record<string, string>;
+  discussionProviderModels: Record<string, string>;
   baseUrl: string;
   temperature: number;
   maxTokens: number;
@@ -42,11 +46,13 @@ export const DEFAULT_API_BASE_URL = "https://api.openai.com/v1";
 export const DEFAULT_TEMPLATE_ID = "default";
 
 export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
+  uiLanguage: "zh",
   autoEnabled: true,
   eagerness: 3,
   providerId: "openai",
   providerApiKeys: {},
   providerModels: { openai: "gpt-4o-mini" },
+  discussionProviderModels: { openai: "gpt-4o-mini" },
   baseUrl: DEFAULT_API_BASE_URL,
   temperature: 0.2,
   maxTokens: 256,
@@ -58,7 +64,7 @@ export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
   promptTemplates: [
     {
       id: DEFAULT_TEMPLATE_ID,
-      name: "Default",
+      name: "默认",
       prompt: DEFAULT_SYSTEM_PROMPT,
     },
   ],
@@ -100,12 +106,19 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
     providerModels[providerId] = loaded.model.trim();
   }
 
+  const discussionProviderModels = {
+    ...providerModels,
+    ...normalizeStringMap(loaded.discussionProviderModels),
+  };
+
   return {
+    uiLanguage: loaded.uiLanguage === "en" ? "en" : "zh",
     autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? DEFAULT_SETTINGS.autoEnabled,
     eagerness: normalizeEagerness(loaded.eagerness ?? DEFAULT_SETTINGS.eagerness),
     providerId,
     providerApiKeys,
     providerModels,
+    discussionProviderModels,
     baseUrl,
     temperature:
       typeof loaded.temperature === "number"
@@ -132,8 +145,7 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
         : DEFAULT_SETTINGS.maxSuffixChars,
     promptTemplates,
     activePromptTemplateId,
-    discussionPrompt:
-      loaded.discussionPrompt?.trim() || DEFAULT_DISCUSSION_PROMPT,
+    discussionPrompt: migrateDiscussionPrompt(loaded.discussionPrompt),
   };
 }
 
@@ -161,6 +173,7 @@ export function setProviderApiKey(
   };
 }
 
+/** Completion model for the active provider. */
 export function getProviderModel(settings: AIAutocompleteSettings): string {
   return settings.providerModels[settings.providerId] ?? "";
 }
@@ -175,12 +188,33 @@ export function setProviderModel(
   };
 }
 
+/** Discussion model is intentionally separate from inline completion. */
+export function getDiscussionProviderModel(
+  settings: AIAutocompleteSettings
+): string {
+  return (
+    settings.discussionProviderModels[settings.providerId] ??
+    getProviderModel(settings)
+  );
+}
+
+export function setDiscussionProviderModel(
+  settings: AIAutocompleteSettings,
+  value: string
+): void {
+  settings.discussionProviderModels = {
+    ...settings.discussionProviderModels,
+    [settings.providerId]: value,
+  };
+}
+
 export function normalizeEagerness(value: number): number {
   return Math.min(5, Math.max(1, Math.round(value)));
 }
 
 export function normalizeReasoningEffort(value: unknown): ReasoningEffort {
-  return value === "none" ||
+  if (value === "none") return "minimal"; // migrate the old ambiguous label
+  return value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high"
@@ -221,8 +255,8 @@ function normalizeTemplates(
     return [
       {
         id: DEFAULT_TEMPLATE_ID,
-        name: "Default",
-        prompt: fallbackPrompt,
+        name: "默认",
+        prompt: migrateCompletionPrompt(fallbackPrompt),
       },
     ];
   }
@@ -235,17 +269,48 @@ function normalizeTemplates(
         typeof template.name === "string" &&
         typeof template.prompt === "string"
     )
-    .map((template) => ({ ...template }));
+    .map((template) => ({
+      ...template,
+      name:
+        template.id === DEFAULT_TEMPLATE_ID && template.name === "Default"
+          ? "默认"
+          : template.name,
+      prompt:
+        template.id === DEFAULT_TEMPLATE_ID
+          ? migrateCompletionPrompt(template.prompt)
+          : template.prompt,
+    }));
 
   return valid.length > 0
     ? valid
     : [
         {
           id: DEFAULT_TEMPLATE_ID,
-          name: "Default",
-          prompt: fallbackPrompt,
+          name: "默认",
+          prompt: migrateCompletionPrompt(fallbackPrompt),
         },
       ];
+}
+
+function migrateCompletionPrompt(prompt: string): string {
+  const trimmed = prompt.trim();
+  if (
+    trimmed.startsWith(
+      "You are an inline completion engine inside the Obsidian Markdown editor."
+    ) && trimmed.includes("NO_SUGGESTION")
+  ) {
+    return DEFAULT_SYSTEM_PROMPT;
+  }
+  return prompt || DEFAULT_SYSTEM_PROMPT;
+}
+
+function migrateDiscussionPrompt(prompt: string | undefined): string {
+  const trimmed = prompt?.trim() ?? "";
+  if (!trimmed) return DEFAULT_DISCUSSION_PROMPT;
+  if (trimmed.startsWith("You are a concise thinking partner inside Obsidian.")) {
+    return DEFAULT_DISCUSSION_PROMPT;
+  }
+  return prompt as string;
 }
 
 function normalizeStringMap(value: unknown): Record<string, string> {
