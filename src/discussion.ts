@@ -6,9 +6,12 @@ import {
 } from "@codemirror/view";
 import { Prec, StateEffect, StateField } from "@codemirror/state";
 
+export type DiscussionStatus = "loading" | "streaming" | "done" | "error";
+
 export interface DiscussionAnswer {
   from: number;
   text: string;
+  status: DiscussionStatus;
 }
 
 const setDiscussionAnswerEffect = StateEffect.define<DiscussionAnswer | null>();
@@ -22,18 +25,24 @@ export const DiscussionAnswerState = StateField.define<DiscussionAnswer | null>(
 
     if (!value) return null;
 
-    // A discussion answer is anchored to a concrete document position. Any
-    // unrelated edit or cursor move dismisses it rather than trying to remap a
-    // potentially stale answer.
-    if (tr.docChanged || tr.selection) return null;
+    // Discussion answers are deliberately persistent UI. Cursor/selection moves
+    // must not dismiss them. When the note changes, remap the anchor so the
+    // answer stays attached to the same logical area of the document.
+    if (tr.docChanged) {
+      return {
+        ...value,
+        from: tr.changes.mapPos(value.from, 1),
+      };
+    }
+
     return value;
   },
   provide: (field) =>
     EditorView.decorations.from(field, (answer) => {
-      if (!answer?.text) return Decoration.none;
+      if (!answer) return Decoration.none;
       return Decoration.set([
         Decoration.widget({
-          widget: new DiscussionWidget(answer.text),
+          widget: new DiscussionWidget(answer.text, answer.status),
           side: 1,
           block: true,
         }).range(answer.from),
@@ -42,25 +51,49 @@ export const DiscussionAnswerState = StateField.define<DiscussionAnswer | null>(
 });
 
 class DiscussionWidget extends WidgetType {
-  constructor(readonly text: string) {
+  constructor(
+    readonly text: string,
+    readonly status: DiscussionStatus
+  ) {
     super();
   }
 
   eq(other: DiscussionWidget): boolean {
-    return other.text === this.text;
+    return other.text === this.text && other.status === this.status;
   }
 
   toDOM(): HTMLElement {
     const container = document.createElement("div");
-    container.className = "ai-autocomplete-discussion-ghost";
+    container.className = `ai-autocomplete-discussion-ghost is-${this.status}`;
 
     const label = document.createElement("div");
     label.className = "ai-autocomplete-discussion-label";
-    label.textContent = "AI";
+
+    const title = document.createElement("span");
+    title.textContent = "AI";
+    label.appendChild(title);
+
+    if (this.status !== "done") {
+      const status = document.createElement("span");
+      status.className = "ai-autocomplete-discussion-status";
+      status.textContent =
+        this.status === "loading"
+          ? "Thinking…"
+          : this.status === "streaming"
+            ? "Generating…"
+            : "Failed";
+      label.appendChild(status);
+    }
 
     const body = document.createElement("div");
     body.className = "ai-autocomplete-discussion-body";
-    body.textContent = this.text;
+    if (this.text) {
+      body.textContent = this.text;
+    } else if (this.status === "loading") {
+      body.textContent = "Waiting for the model…";
+    } else if (this.status === "streaming") {
+      body.textContent = "Receiving answer…";
+    }
 
     container.append(label, body);
     return container;
@@ -75,14 +108,46 @@ function currentDiscussion(view: EditorView): DiscussionAnswer | null {
   return view.state.field(DiscussionAnswerState, false) ?? null;
 }
 
-export function showDiscussionAnswer(
-  view: EditorView,
-  from: number,
-  text: string
-): void {
+export function showDiscussionLoading(view: EditorView, from: number): void {
   view.dispatch({
-    effects: setDiscussionAnswerEffect.of({ from, text }),
+    effects: setDiscussionAnswerEffect.of({
+      from,
+      text: "",
+      status: "loading",
+    }),
   });
+}
+
+export function updateDiscussionAnswer(
+  view: EditorView,
+  text: string,
+  status: DiscussionStatus = "streaming"
+): boolean {
+  const answer = currentDiscussion(view);
+  if (!answer) return false;
+
+  view.dispatch({
+    effects: setDiscussionAnswerEffect.of({
+      ...answer,
+      text,
+      status,
+    }),
+  });
+  return true;
+}
+
+export function finishDiscussionAnswer(
+  view: EditorView,
+  text: string
+): boolean {
+  return updateDiscussionAnswer(view, text, "done");
+}
+
+export function showDiscussionError(
+  view: EditorView,
+  message: string
+): boolean {
+  return updateDiscussionAnswer(view, message, "error");
 }
 
 export function dismissDiscussionAnswer(view: EditorView): boolean {
@@ -93,9 +158,12 @@ export function dismissDiscussionAnswer(view: EditorView): boolean {
 
 export function acceptDiscussionAnswer(view: EditorView): boolean {
   const answer = currentDiscussion(view);
-  if (!answer) return false;
+  if (!answer || answer.status !== "done" || !answer.text.trim()) return false;
 
-  const before = view.state.doc.sliceString(Math.max(0, answer.from - 1), answer.from);
+  const before = view.state.doc.sliceString(
+    Math.max(0, answer.from - 1),
+    answer.from
+  );
   const prefix = before === "\n" || answer.from === 0 ? "" : "\n";
   const insert = `${prefix}\n${answer.text}`;
   const end = answer.from + insert.length;
