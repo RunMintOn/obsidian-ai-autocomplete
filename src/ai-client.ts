@@ -23,7 +23,7 @@ import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { togetherProvider } from "@earendil-works/pi-ai/providers/together";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { zaiProvider } from "@earendil-works/pi-ai/providers/zai";
-import { providerFetch } from "./transport";
+import { providerFetch } from "./transport.js";
 
 export const NO_SUGGESTION = "NO_SUGGESTION";
 
@@ -51,7 +51,6 @@ export const DEFAULT_DISCUSSION_PROMPT = `你是 Obsidian 中的思考与讨论�
 - 回答需要适合在侧边栏阅读：能简洁就简洁，需要深入时再展开。
 - 不要提及系统提示词，也不要解释内部 XML 风格的上下文标签。`;
 
-/** Empty string means: do not send a pi-ai reasoning level. */
 export type ReasoningEffort = "" | "minimal" | "low" | "medium" | "high";
 
 export interface ChatMessage {
@@ -98,11 +97,29 @@ export class CompletionError extends Error {
 
 type ProviderFactory = () => Provider<Api>;
 
-const PROVIDER_DEFINITIONS: Array<{
+interface ProviderDefinition {
   id: string;
   name: string;
   factory: ProviderFactory;
-}> = [
+}
+
+interface ResolvedRuntime {
+  provider: Provider<Api>;
+  model: Model<Api>;
+  keyless: boolean;
+}
+
+interface CustomRuntime {
+  key: string;
+  provider: Provider<Api>;
+  model: Model<Api>;
+}
+
+const CUSTOM_PROVIDER_ID = "ai-autocomplete-custom";
+const CUSTOM_PROVIDER_NAME = "Custom OpenAI-compatible";
+const CUSTOM_MODEL_MAX_TOKENS = 65536;
+
+const PROVIDER_DEFINITIONS: ProviderDefinition[] = [
   { id: "openai", name: "OpenAI", factory: openaiProvider as ProviderFactory },
   { id: "anthropic", name: "Anthropic", factory: anthropicProvider as ProviderFactory },
   { id: "google", name: "Google Gemini", factory: googleProvider as ProviderFactory },
@@ -119,30 +136,37 @@ const PROVIDER_DEFINITIONS: Array<{
 ];
 
 const providerCache = new Map<string, Provider<Api>>();
-let customRuntime:
-  | { key: string; provider: Provider<Api>; model: Model<Api> }
-  | null = null;
+let customRuntime: CustomRuntime | null = null;
 
 export function getProviderOptions(): ProviderOption[] {
-  return [
-    ...PROVIDER_DEFINITIONS.map(({ id, name }) => ({ id, name })),
-    { id: "custom", name: "Custom OpenAI-compatible", custom: true },
-  ];
+  const providers: ProviderOption[] = [];
+  for (const definition of PROVIDER_DEFINITIONS) {
+    providers.push({ id: definition.id, name: definition.name });
+  }
+  providers.push({ id: "custom", name: CUSTOM_PROVIDER_NAME, custom: true });
+  return providers;
 }
 
 export function getProviderModels(providerId: string): ModelOption[] {
   if (providerId === "custom") return [];
+
   const provider = getBuiltinProvider(providerId);
   if (!provider) return [];
 
-  return [...provider.getModels()]
-    .map((model) => ({
+  const models: ModelOption[] = [];
+  for (const model of provider.getModels()) {
+    models.push({
       id: model.id,
       name: model.name || model.id,
       reasoning: Boolean(model.reasoning),
       maxTokens: model.maxTokens,
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    });
+  }
+
+  models.sort(function compareModelNames(a, b): number {
+    return a.name.localeCompare(b.name);
+  });
+  return models;
 }
 
 export async function streamChatCompletion(
@@ -154,30 +178,17 @@ export async function streamChatCompletion(
   if (signal.aborted) throw abortError();
 
   try {
-    const { provider, model, keyless } = resolveRuntime(options);
-    const requestOptions: SimpleStreamOptions = {
-      signal,
-      temperature: options.temperature,
-      maxTokens: Math.min(options.maxTokens, model.maxTokens || options.maxTokens),
-      maxRetries: 0,
-      fetch: providerFetch,
-    };
-
-    const apiKey = options.apiKey.trim();
-    if (apiKey) requestOptions.apiKey = apiKey;
-    else if (keyless) requestOptions.apiKey = "unused";
-
-    const reasoning = toPiReasoning(options.reasoningEffort);
-    if (reasoning) requestOptions.reasoning = reasoning;
-
-    const stream = provider.streamSimple(
-      model,
-      buildContext(messages, model),
+    const runtime = resolveRuntime(options);
+    const requestOptions = createRequestOptions(options, runtime, signal);
+    const stream = runtime.provider.streamSimple(
+      runtime.model,
+      buildContext(messages, runtime.model),
       requestOptions
     );
 
     let streamedThinking = "";
     let streamedText = "";
+
     for await (const event of stream) {
       if (signal.aborted) throw abortError();
 
@@ -201,16 +212,12 @@ export async function streamChatCompletion(
 
     const result = await stream.result();
     if (signal.aborted) throw abortError();
+
     const text = extractTextOrThrow(result);
     if (text && text !== streamedText) callbacks.onText?.(text);
     return text;
   } catch (error) {
-    if (error instanceof CompletionError) throw error;
-    if (error instanceof Error) {
-      if (error.name === "AbortError") throw error;
-      throw new CompletionError(error.message);
-    }
-    throw new CompletionError("Unknown completion error");
+    throw normalizeCompletionError(error);
   }
 }
 
@@ -230,24 +237,54 @@ export async function fetchCompletion(
 ): Promise<string | null> {
   const systemPrompt = options.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
   const userMessage = `<before_cursor>\n${prefix}\n</before_cursor>\n\n<cursor/>\n\n<after_cursor>\n${suffix}\n</after_cursor>\n\n只返回应该直接插入 <cursor> 的准确文本；如果需要前导空格或换行，请保留。`;
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userMessage },
+  ];
 
-  const text = await fetchChatCompletion(
-    options,
-    [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userMessage },
-    ],
-    signal
-  );
+  const text = await fetchChatCompletion(options, messages, signal);
+  if (text === null) return null;
+  return normalizeCompletion(text);
+}
 
-  return text == null ? null : normalizeCompletion(text);
+function createRequestOptions(
+  options: CompletionRequestOptions,
+  runtime: ResolvedRuntime,
+  signal: AbortSignal
+): SimpleStreamOptions {
+  const requestOptions: SimpleStreamOptions = {
+    signal,
+    temperature: options.temperature,
+    maxTokens: Math.min(
+      options.maxTokens,
+      runtime.model.maxTokens || options.maxTokens
+    ),
+    maxRetries: 0,
+    fetch: providerFetch,
+  };
+
+  const apiKey = options.apiKey.trim();
+  if (apiKey) {
+    requestOptions.apiKey = apiKey;
+  } else if (runtime.keyless) {
+    requestOptions.apiKey = "unused";
+  }
+
+  const reasoning = toPiReasoning(options.reasoningEffort);
+  if (reasoning) requestOptions.reasoning = reasoning;
+
+  return requestOptions;
 }
 
 function getBuiltinProvider(providerId: string): Provider<Api> | null {
   const cached = providerCache.get(providerId);
   if (cached) return cached;
 
-  const definition = PROVIDER_DEFINITIONS.find((item) => item.id === providerId);
+  const definition = PROVIDER_DEFINITIONS.find(
+    function matchesProvider(item): boolean {
+      return item.id === providerId;
+    }
+  );
   if (!definition) return null;
 
   const provider = definition.factory();
@@ -255,47 +292,64 @@ function getBuiltinProvider(providerId: string): Provider<Api> | null {
   return provider;
 }
 
-function resolveRuntime(options: CompletionRequestOptions): {
-  provider: Provider<Api>;
-  model: Model<Api>;
-  keyless: boolean;
-} {
+function resolveRuntime(options: CompletionRequestOptions): ResolvedRuntime {
   const modelId = options.model.trim();
   if (!modelId) throw new CompletionError("Model is empty");
 
-  if (options.providerId !== "custom") {
-    const provider = getBuiltinProvider(options.providerId);
-    if (!provider) {
-      throw new CompletionError(`Unknown provider: ${options.providerId}`);
-    }
-    const model = provider.getModels().find((candidate) => candidate.id === modelId);
-    if (!model) {
-      throw new CompletionError(
-        `Model “${modelId}” is not in the ${provider.name} pi-ai catalog. Choose a listed model or use Custom OpenAI-compatible.`
-      );
-    }
-    return { provider, model, keyless: false };
+  if (options.providerId === "custom") {
+    return resolveCustomRuntime(options.baseUrl, modelId);
+  }
+  return resolveBuiltinRuntime(options.providerId, modelId);
+}
+
+function resolveBuiltinRuntime(
+  providerId: string,
+  modelId: string
+): ResolvedRuntime {
+  const provider = getBuiltinProvider(providerId);
+  if (!provider) {
+    throw new CompletionError(`Unknown provider: ${providerId}`);
   }
 
-  const baseUrl = normalizeApiRoot(options.baseUrl);
+  const model = provider.getModels().find(function matchesModel(candidate): boolean {
+    return candidate.id === modelId;
+  });
+  if (!model) {
+    throw new CompletionError(
+      `Model “${modelId}” is not in the ${provider.name} pi-ai catalog. Choose a listed model or use Custom OpenAI-compatible.`
+    );
+  }
+
+  return { provider, model, keyless: false };
+}
+
+function resolveCustomRuntime(baseUrlValue: string, modelId: string): ResolvedRuntime {
+  const baseUrl = normalizeApiRoot(baseUrlValue);
   const key = `${baseUrl}\u0000${modelId}`;
-  if (customRuntime?.key === key) {
-    return {
-      provider: customRuntime.provider,
-      model: customRuntime.model,
-      keyless: true,
-    };
+
+  if (customRuntime?.key !== key) {
+    customRuntime = createCustomRuntime(baseUrl, modelId, key);
   }
 
+  return {
+    provider: customRuntime.provider,
+    model: customRuntime.model,
+    keyless: true,
+  };
+}
+
+function createCustomRuntime(
+  baseUrl: string,
+  modelId: string,
+  key: string
+): CustomRuntime {
   const model: Model<"openai-completions"> = {
     id: modelId,
     name: modelId,
     api: "openai-completions",
-    provider: "ai-autocomplete-custom",
+    provider: CUSTOM_PROVIDER_ID,
     baseUrl,
     reasoning: true,
-    // pi-ai uses normalized levels. For our generic OpenAI-compatible custom
-    // endpoint, minimal maps to the commonly-supported reasoning_effort=none.
     thinkingLevelMap: {
       minimal: "none",
       low: "low",
@@ -305,7 +359,7 @@ function resolveRuntime(options: CompletionRequestOptions): {
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 131072,
-    maxTokens: 65536,
+    maxTokens: CUSTOM_MODEL_MAX_TOKENS,
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: true,
@@ -315,8 +369,8 @@ function resolveRuntime(options: CompletionRequestOptions): {
   };
 
   const provider = createProvider({
-    id: "ai-autocomplete-custom",
-    name: "Custom OpenAI-compatible",
+    id: CUSTOM_PROVIDER_ID,
+    name: CUSTOM_PROVIDER_NAME,
     baseUrl,
     auth: {
       apiKey: {
@@ -330,34 +384,40 @@ function resolveRuntime(options: CompletionRequestOptions): {
     api: openAICompletionsApi(),
   }) as Provider<Api>;
 
-  customRuntime = { key, provider, model };
-  return { provider, model, keyless: true };
+  return { key, provider, model };
 }
 
 function toPiReasoning(
   effort: ReasoningEffort | undefined
 ): ThinkingLevel | undefined {
-  return effort || undefined;
+  if (!effort) return undefined;
+  return effort;
 }
 
 function buildContext(messages: ChatMessage[], model: Model<Api>): Context {
   const systemPrompt = messages
-    .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .filter(function isSystemMessage(message): boolean {
+      return message.role === "system";
+    })
+    .map(function getMessageContent(message): string {
+      return message.content;
+    })
     .join("\n\n");
 
   const contextMessages: Context["messages"] = [];
   for (const message of messages) {
     if (message.role === "system") continue;
+
     if (message.role === "user") {
       contextMessages.push({
         role: "user",
         content: message.content,
         timestamp: Date.now(),
       });
-    } else {
-      contextMessages.push(syntheticAssistantMessage(message.content, model));
+      continue;
     }
+
+    contextMessages.push(syntheticAssistantMessage(message.content, model));
   }
 
   return {
@@ -398,9 +458,9 @@ function extractTextOrThrow(message: AssistantMessage): string | null {
   const text = contentText(message.content, "");
   if (text) return text;
 
-  const hasThinking = message.content.some(
-    (block) => block.type === "thinking" && block.thinking.trim().length > 0
-  );
+  const hasThinking = message.content.some(function hasThinkingContent(block): boolean {
+    return block.type === "thinking" && block.thinking.trim().length > 0;
+  });
   if (hasThinking && message.stopReason === "length") {
     throw new CompletionError(
       "The model reached the output limit while reasoning before it produced answer text. Increase the token budget or lower the reasoning level."
@@ -423,8 +483,19 @@ function normalizeCompletion(text: string): string | null {
 function normalizeApiRoot(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
   if (!trimmed) throw new CompletionError("Custom provider base URL is empty");
+
   const suffix = "/chat/completions";
-  return trimmed.endsWith(suffix) ? trimmed.slice(0, -suffix.length) : trimmed;
+  if (trimmed.endsWith(suffix)) {
+    return trimmed.slice(0, -suffix.length);
+  }
+  return trimmed;
+}
+
+function normalizeCompletionError(error: unknown): Error {
+  if (error instanceof CompletionError) return error;
+  if (error instanceof Error && error.name === "AbortError") return error;
+  if (error instanceof Error) return new CompletionError(error.message);
+  return new CompletionError("Unknown completion error");
 }
 
 function abortError(): Error {
