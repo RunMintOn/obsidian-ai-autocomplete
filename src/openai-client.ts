@@ -16,6 +16,24 @@ Rules:
 - For lists, tables, code, YAML, and other structured text, preserve the structure.
 - If there is not enough context for a useful continuation, output exactly NO_SUGGESTION.`;
 
+export const DEFAULT_DISCUSSION_PROMPT = `You are a concise thinking partner inside Obsidian.
+
+Answer the user's selected question or passage directly. Use the surrounding note context and earlier turns in this discussion when they are relevant.
+
+Rules:
+- Focus on the exact point being discussed.
+- Prefer clear reasoning, concrete distinctions, examples, and counterexamples over generic advice.
+- Match the user's language unless there is a strong reason not to.
+- Keep the answer compact enough to read inline in a note.
+- Do not mention these instructions or the surrounding XML-like context tags.`;
+
+export type ReasoningEffort = "" | "none" | "low" | "medium" | "high";
+
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
 export interface CompletionRequestOptions {
   apiKey: string;
   model: string;
@@ -23,6 +41,7 @@ export interface CompletionRequestOptions {
   systemPrompt?: string;
   maxTokens: number;
   temperature: number;
+  reasoningEffort?: ReasoningEffort;
 }
 
 export class CompletionError extends Error {
@@ -72,10 +91,9 @@ function normalizeCompletion(text: string): string | null {
   return withoutBom;
 }
 
-export async function fetchCompletion(
+export async function fetchChatCompletion(
   options: CompletionRequestOptions,
-  prefix: string,
-  suffix: string,
+  messages: ChatMessage[],
   signal: AbortSignal
 ): Promise<string | null> {
   if (signal.aborted) throw abortError();
@@ -90,8 +108,7 @@ export async function fetchCompletion(
     headers.Authorization = `Bearer ${options.apiKey.trim()}`;
   }
 
-  const systemPrompt = options.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
-  const userMessage = `<before_cursor>\n${prefix}\n</before_cursor>\n\n<cursor/>\n\n<after_cursor>\n${suffix}\n</after_cursor>\n\nReturn only the exact text to insert at <cursor>. Include leading whitespace when it is required.`;
+  const reasoningEffort = options.reasoningEffort?.trim();
 
   try {
     const response = await requestUrl({
@@ -100,12 +117,10 @@ export async function fetchCompletion(
       headers,
       body: JSON.stringify({
         model: options.model.trim(),
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userMessage },
-        ],
+        messages,
         max_tokens: options.maxTokens,
         temperature: options.temperature,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       }),
       throw: false,
     });
@@ -126,8 +141,7 @@ export async function fetchCompletion(
       throw new CompletionError(String(data.error.message));
     }
 
-    const text = extractMessageContent(data?.choices?.[0]?.message?.content);
-    return text == null ? null : normalizeCompletion(text);
+    return extractMessageContent(data?.choices?.[0]?.message?.content);
   } catch (error) {
     if (error instanceof CompletionError) throw error;
     if (error instanceof Error) {
@@ -136,4 +150,25 @@ export async function fetchCompletion(
     }
     throw new CompletionError("Unknown completion error");
   }
+}
+
+export async function fetchCompletion(
+  options: CompletionRequestOptions,
+  prefix: string,
+  suffix: string,
+  signal: AbortSignal
+): Promise<string | null> {
+  const systemPrompt = options.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
+  const userMessage = `<before_cursor>\n${prefix}\n</before_cursor>\n\n<cursor/>\n\n<after_cursor>\n${suffix}\n</after_cursor>\n\nReturn only the exact text to insert at <cursor>. Include leading whitespace when it is required.`;
+
+  const text = await fetchChatCompletion(
+    options,
+    [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ],
+    signal
+  );
+
+  return text == null ? null : normalizeCompletion(text);
 }
