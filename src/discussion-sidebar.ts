@@ -1,7 +1,11 @@
 import { ItemView, WorkspaceLeaf } from "obsidian";
-import type { ModelOption, ReasoningEffort } from "./ai-client";
-import { tr } from "./i18n";
-import type { UiLanguage } from "./settings";
+import type { ModelOption, ReasoningEffort } from "./ai-client.js";
+import { tr } from "./i18n.js";
+import {
+  MAX_TOKEN_BUDGET,
+  MIN_TOKEN_BUDGET,
+  type UiLanguage,
+} from "./settings.js";
 
 export const VIEW_TYPE_AI_DISCUSSION = "ai-autocomplete-discussion";
 
@@ -95,6 +99,29 @@ export class DiscussionSidebarView extends ItemView {
 
   async onClose(): Promise<void> {
     this.contentEl.empty();
+    this.clearElementReferences();
+  }
+
+  refresh(): void {
+    if (!this.rootEl) return;
+
+    const snapshot = this.host.getDiscussionSnapshot();
+    const language = snapshot.language ?? "zh";
+    this.busy = isBusyStatus(snapshot.status);
+
+    this.renderHeader(snapshot, language);
+    this.renderReference(snapshot, language);
+    this.renderMessages(snapshot, language);
+    this.renderStatus(snapshot, language);
+    this.renderControls(snapshot, language);
+    this.renderComposerState(language);
+  }
+
+  focusInput(): void {
+    this.inputEl?.focus();
+  }
+
+  private clearElementReferences(): void {
     this.rootEl = null;
     this.titleEl = null;
     this.noteEl = null;
@@ -115,13 +142,10 @@ export class DiscussionSidebarView extends ItemView {
     this.hintEl = null;
   }
 
-  refresh(): void {
-    if (!this.rootEl) return;
-    const snapshot = this.host.getDiscussionSnapshot();
-    const language = snapshot.language ?? "zh";
-    this.busy =
-      snapshot.status === "thinking" || snapshot.status === "generating";
-
+  private renderHeader(
+    snapshot: DiscussionSnapshot,
+    language: UiLanguage
+  ): void {
     if (this.titleEl) {
       this.titleEl.textContent = tr(language, "AI 讨论", "AI Discussion");
     }
@@ -132,7 +156,6 @@ export class DiscussionSidebarView extends ItemView {
     if (this.referenceLabelEl) {
       this.referenceLabelEl.textContent = tr(language, "参考选文", "Reference");
     }
-
     if (this.newButtonEl) {
       this.newButtonEl.textContent = tr(language, "新对话", "New");
       this.newButtonEl.setAttribute(
@@ -146,30 +169,40 @@ export class DiscussionSidebarView extends ItemView {
     if (this.clearButtonEl) {
       this.clearButtonEl.textContent = tr(language, "清除", "Clear");
     }
+  }
 
-    if (this.referenceWrapEl && this.referenceEl) {
-      const hasReference = Boolean(snapshot.reference.trim());
-      this.referenceWrapEl.toggleClass("is-empty", !hasReference);
-      this.referenceEl.textContent = hasReference
-        ? snapshot.reference
-        : tr(
-            language,
-            "在编辑器中选中文字后执行“在侧栏讨论选文”，或者点击上方“使用选文”。",
-            "Select text in the editor and run “Discuss selection”, or use the button above."
-          );
+  private renderReference(
+    snapshot: DiscussionSnapshot,
+    language: UiLanguage
+  ): void {
+    if (!this.referenceWrapEl || !this.referenceEl) return;
+
+    const hasReference = Boolean(snapshot.reference.trim());
+    this.referenceWrapEl.toggleClass("is-empty", !hasReference);
+
+    if (hasReference) {
+      this.referenceEl.textContent = snapshot.reference;
+      return;
     }
 
-    this.renderMessages(snapshot, language);
-    this.renderStatus(snapshot, language);
-    this.renderControls(snapshot, language);
+    this.referenceEl.textContent = tr(
+      language,
+      "在编辑器中选中文字后执行“在侧栏讨论选文”，或者点击上方“使用选文”。",
+      "Select text in the editor and run “Discuss selection”, or use the button above."
+    );
+  }
 
+  private renderComposerState(language: UiLanguage): void {
     if (this.sendButtonEl) {
-      this.sendButtonEl.textContent = this.busy
-        ? tr(language, "停止", "Stop")
-        : tr(language, "发送", "Send");
+      if (this.busy) {
+        this.sendButtonEl.textContent = tr(language, "停止", "Stop");
+      } else {
+        this.sendButtonEl.textContent = tr(language, "发送", "Send");
+      }
       this.sendButtonEl.toggleClass("mod-cta", !this.busy);
       this.sendButtonEl.toggleClass("mod-warning", this.busy);
     }
+
     if (this.inputEl) {
       this.inputEl.placeholder = tr(
         language,
@@ -177,6 +210,7 @@ export class DiscussionSidebarView extends ItemView {
         "Ask about the selection or continue the discussion…"
       );
     }
+
     if (this.hintEl) {
       this.hintEl.textContent = tr(
         language,
@@ -184,10 +218,6 @@ export class DiscussionSidebarView extends ItemView {
         "Enter to send · Shift+Enter for newline"
       );
     }
-  }
-
-  focusInput(): void {
-    this.inputEl?.focus();
   }
 
   private build(): void {
@@ -233,10 +263,9 @@ export class DiscussionSidebarView extends ItemView {
       text: "Use selection",
     });
     this.captureButtonEl.addEventListener("click", () => {
-      if (this.host.captureCurrentSelection()) {
-        this.refresh();
-        this.focusInput();
-      }
+      if (!this.host.captureCurrentSelection()) return;
+      this.refresh();
+      this.focusInput();
     });
 
     this.clearButtonEl = referenceActions.createEl("button", { text: "Clear" });
@@ -255,7 +284,6 @@ export class DiscussionSidebarView extends ItemView {
     this.messagesEl = this.rootEl.createDiv({
       cls: "ai-autocomplete-chat-messages",
     });
-
     this.statusEl = this.rootEl.createDiv({
       cls: "ai-autocomplete-chat-status",
     });
@@ -263,11 +291,13 @@ export class DiscussionSidebarView extends ItemView {
     const composer = this.rootEl.createDiv({
       cls: "ai-autocomplete-chat-composer",
     });
-
     const controls = composer.createDiv({
       cls: "ai-autocomplete-chat-controls",
     });
-    const modelSlot = controls.createDiv({ cls: "ai-autocomplete-control-model" });
+    const modelSlot = controls.createDiv({
+      cls: "ai-autocomplete-control-model",
+    });
+
     this.modelControlEl = modelSlot.createEl("select");
     this.reasoningEl = controls.createEl("select", {
       cls: "ai-autocomplete-control-reasoning",
@@ -276,8 +306,8 @@ export class DiscussionSidebarView extends ItemView {
       cls: "ai-autocomplete-control-tokens",
       attr: {
         type: "number",
-        min: "16",
-        max: "65536",
+        min: String(MIN_TOKEN_BUDGET),
+        max: String(MAX_TOKEN_BUDGET),
         step: "16",
       },
     });
@@ -285,17 +315,15 @@ export class DiscussionSidebarView extends ItemView {
     this.reasoningHintEl = composer.createDiv({
       cls: "ai-autocomplete-reasoning-hint",
     });
-
     this.inputEl = composer.createEl("textarea", {
       cls: "ai-autocomplete-chat-input",
       attr: { rows: "4" },
     });
-
     this.inputEl.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        if (!this.busy) void this.submit();
-      }
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+
+      event.preventDefault();
+      if (!this.busy) void this.submit();
     });
 
     const composerFooter = composer.createDiv({
@@ -309,8 +337,11 @@ export class DiscussionSidebarView extends ItemView {
       text: "Send",
     });
     this.sendButtonEl.addEventListener("click", () => {
-      if (this.busy) this.host.cancelDiscussion();
-      else void this.submit();
+      if (this.busy) {
+        this.host.cancelDiscussion();
+        return;
+      }
+      void this.submit();
     });
   }
 
@@ -318,104 +349,143 @@ export class DiscussionSidebarView extends ItemView {
     snapshot: DiscussionSnapshot,
     language: UiLanguage
   ): void {
-    const modelOptions = snapshot.modelOptions ?? [];
-    const modelId = snapshot.modelId ?? "";
-    const providerId = snapshot.providerId ?? "";
-
-    const slot = this.modelControlEl?.parentElement;
-    if (slot && this.modelControlEl) {
-      const shouldUseText = providerId === "custom" || modelOptions.length === 0;
-      const isText = this.modelControlEl instanceof HTMLInputElement;
-      if (shouldUseText !== isText) {
-        this.modelControlEl.remove();
-        this.modelControlEl = shouldUseText
-          ? slot.createEl("input", {
-              cls: "ai-autocomplete-control-model-input",
-              attr: { type: "text" },
-            })
-          : slot.createEl("select");
-      }
-
-      if (this.modelControlEl instanceof HTMLSelectElement) {
-        this.modelControlEl.empty();
-        for (const model of modelOptions) {
-          this.modelControlEl.createEl("option", {
-            value: model.id,
-            text: model.name,
-          });
-        }
-        if (modelId && !modelOptions.some((model) => model.id === modelId)) {
-          this.modelControlEl.createEl("option", {
-            value: modelId,
-            text: `${modelId} *`,
-          });
-        }
-        this.modelControlEl.value = modelId;
-        this.modelControlEl.disabled = this.busy;
-        this.modelControlEl.onchange = () => {
-          const value = (this.modelControlEl as HTMLSelectElement).value;
-          if (value && this.host.setDiscussionModel) {
-            void this.host.setDiscussionModel(value);
-          }
-        };
-      } else {
-        this.modelControlEl.value = modelId;
-        this.modelControlEl.placeholder = tr(language, "讨论模型", "Discussion model");
-        this.modelControlEl.disabled = this.busy;
-        this.modelControlEl.onchange = () => {
-          const value = (this.modelControlEl as HTMLInputElement).value.trim();
-          if (value && this.host.setDiscussionModel) {
-            void this.host.setDiscussionModel(value);
-          }
-        };
-      }
-      this.modelControlEl.title = `${snapshot.providerName ?? providerId} · ${tr(
-        language,
-        "讨论模型",
-        "Discussion model"
-      )}`;
-    }
-
-    if (this.reasoningEl) {
-      const reasoning = snapshot.reasoning ?? "";
-      this.reasoningEl.empty();
-      const options: Array<[ReasoningEffort, string]> = [
-        ["", tr(language, "思考：Provider 默认", "Reasoning: Provider default")],
-        ["minimal", tr(language, "思考：Minimal", "Reasoning: Minimal")],
-        ["low", tr(language, "思考：Low", "Reasoning: Low")],
-        ["medium", tr(language, "思考：Medium", "Reasoning: Medium")],
-        ["high", tr(language, "思考：High", "Reasoning: High")],
-      ];
-      for (const [value, label] of options) {
-        this.reasoningEl.createEl("option", { value, text: label });
-      }
-      this.reasoningEl.value = reasoning;
-      this.reasoningEl.disabled = this.busy;
-      this.reasoningEl.onchange = () => {
-        const value = this.reasoningEl?.value as ReasoningEffort;
-        if (this.host.setDiscussionReasoning) {
-          void this.host.setDiscussionReasoning(value);
-        }
-      };
-    }
-
-    if (this.tokenEl) {
-      this.tokenEl.value = String(snapshot.tokenBudget ?? 4096);
-      this.tokenEl.title = tr(language, "最大输出 Token", "Maximum output tokens");
-      this.tokenEl.disabled = this.busy;
-      this.tokenEl.onchange = () => {
-        const value = Number(this.tokenEl?.value);
-        if (Number.isFinite(value) && this.host.setDiscussionTokenBudget) {
-          void this.host.setDiscussionTokenBudget(
-            Math.min(65536, Math.max(16, Math.round(value)))
-          );
-        }
-      };
-    }
+    this.renderModelControl(snapshot, language);
+    this.renderReasoningControl(snapshot, language);
+    this.renderTokenControl(snapshot, language);
 
     if (this.reasoningHintEl) {
       this.reasoningHintEl.textContent = snapshot.reasoningHint ?? "";
     }
+  }
+
+  private renderModelControl(
+    snapshot: DiscussionSnapshot,
+    language: UiLanguage
+  ): void {
+    if (!this.modelControlEl) return;
+
+    const modelOptions = snapshot.modelOptions ?? [];
+    const modelId = snapshot.modelId ?? "";
+    const providerId = snapshot.providerId ?? "";
+    const slot = this.modelControlEl.parentElement;
+    if (!slot) return;
+
+    const shouldUseTextInput =
+      providerId === "custom" || modelOptions.length === 0;
+    const isTextInput = this.modelControlEl instanceof HTMLInputElement;
+    if (shouldUseTextInput !== isTextInput) {
+      this.modelControlEl.remove();
+      this.modelControlEl = createModelControl(slot, shouldUseTextInput);
+    }
+
+    if (this.modelControlEl instanceof HTMLSelectElement) {
+      this.syncCatalogModelControl(this.modelControlEl, modelOptions, modelId);
+    } else {
+      this.syncTextModelControl(this.modelControlEl, modelId, language);
+    }
+
+    this.modelControlEl.disabled = this.busy;
+    this.modelControlEl.title = `${snapshot.providerName ?? providerId} · ${tr(
+      language,
+      "讨论模型",
+      "Discussion model"
+    )}`;
+  }
+
+  private syncCatalogModelControl(
+    control: HTMLSelectElement,
+    modelOptions: readonly ModelOption[],
+    modelId: string
+  ): void {
+    control.empty();
+
+    for (const model of modelOptions) {
+      control.createEl("option", {
+        value: model.id,
+        text: model.name,
+      });
+    }
+
+    const hasCurrentModel = modelOptions.some((model) => model.id === modelId);
+    if (modelId && !hasCurrentModel) {
+      control.createEl("option", {
+        value: modelId,
+        text: `${modelId} *`,
+      });
+    }
+
+    control.value = modelId;
+    control.onchange = () => {
+      const value = control.value;
+      if (value && this.host.setDiscussionModel) {
+        void this.host.setDiscussionModel(value);
+      }
+    };
+  }
+
+  private syncTextModelControl(
+    control: HTMLInputElement,
+    modelId: string,
+    language: UiLanguage
+  ): void {
+    control.value = modelId;
+    control.placeholder = tr(language, "讨论模型", "Discussion model");
+    control.onchange = () => {
+      const value = control.value.trim();
+      if (value && this.host.setDiscussionModel) {
+        void this.host.setDiscussionModel(value);
+      }
+    };
+  }
+
+  private renderReasoningControl(
+    snapshot: DiscussionSnapshot,
+    language: UiLanguage
+  ): void {
+    if (!this.reasoningEl) return;
+
+    const options: Array<[ReasoningEffort, string]> = [
+      ["", tr(language, "思考：Provider 默认", "Reasoning: Provider default")],
+      ["minimal", tr(language, "思考：Minimal", "Reasoning: Minimal")],
+      ["low", tr(language, "思考：Low", "Reasoning: Low")],
+      ["medium", tr(language, "思考：Medium", "Reasoning: Medium")],
+      ["high", tr(language, "思考：High", "Reasoning: High")],
+    ];
+
+    this.reasoningEl.empty();
+    for (const [value, label] of options) {
+      this.reasoningEl.createEl("option", { value, text: label });
+    }
+
+    this.reasoningEl.value = snapshot.reasoning ?? "";
+    this.reasoningEl.disabled = this.busy;
+    this.reasoningEl.onchange = () => {
+      const value = this.reasoningEl?.value as ReasoningEffort;
+      if (this.host.setDiscussionReasoning) {
+        void this.host.setDiscussionReasoning(value);
+      }
+    };
+  }
+
+  private renderTokenControl(
+    snapshot: DiscussionSnapshot,
+    language: UiLanguage
+  ): void {
+    if (!this.tokenEl) return;
+
+    this.tokenEl.value = String(snapshot.tokenBudget ?? 4096);
+    this.tokenEl.title = tr(language, "最大输出 Token", "Maximum output tokens");
+    this.tokenEl.disabled = this.busy;
+    this.tokenEl.onchange = () => {
+      const value = Number(this.tokenEl?.value);
+      if (!Number.isFinite(value) || !this.host.setDiscussionTokenBudget) return;
+
+      const normalized = Math.min(
+        MAX_TOKEN_BUDGET,
+        Math.max(MIN_TOKEN_BUDGET, Math.round(value))
+      );
+      void this.host.setDiscussionTokenBudget(normalized);
+    };
   }
 
   private renderMessages(
@@ -423,20 +493,18 @@ export class DiscussionSidebarView extends ItemView {
     language: UiLanguage
   ): void {
     if (!this.messagesEl) return;
-    const wasNearBottom =
-      this.messagesEl.scrollHeight -
-        this.messagesEl.scrollTop -
-        this.messagesEl.clientHeight <
-      80;
 
-    this.messagesEl.empty();
+    const messagesEl = this.messagesEl;
+    const wasNearBottom =
+      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+    messagesEl.empty();
 
     if (
       snapshot.turns.length === 0 &&
       !snapshot.streamingText &&
       !snapshot.streamingThinking
     ) {
-      this.messagesEl.createDiv({
+      messagesEl.createDiv({
         cls: "ai-autocomplete-chat-empty",
         text: tr(
           language,
@@ -449,14 +517,14 @@ export class DiscussionSidebarView extends ItemView {
     for (const turn of snapshot.turns) {
       if (turn.role === "user") {
         this.createUserMessage(turn.content, language);
-      } else {
-        this.createAssistantMessage(
-          turn.content,
-          turn.thinking ?? "",
-          language,
-          false
-        );
+        continue;
       }
+      this.createAssistantMessage(
+        turn.content,
+        turn.thinking ?? "",
+        language,
+        false
+      );
     }
 
     if (snapshot.streamingText || snapshot.streamingThinking) {
@@ -468,17 +536,18 @@ export class DiscussionSidebarView extends ItemView {
       );
     }
 
-    if (wasNearBottom || snapshot.streamingText || snapshot.streamingThinking) {
-      requestAnimationFrame(() => {
-        if (this.messagesEl) {
-          this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-        }
-      });
+    if (!wasNearBottom && !snapshot.streamingText && !snapshot.streamingThinking) {
+      return;
     }
+
+    requestAnimationFrame(function scrollMessagesToBottom(): void {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
   }
 
   private createUserMessage(content: string, language: UiLanguage): void {
     if (!this.messagesEl) return;
+
     const message = this.messagesEl.createDiv({
       cls: "ai-autocomplete-chat-message is-user",
     });
@@ -499,11 +568,11 @@ export class DiscussionSidebarView extends ItemView {
     streaming: boolean
   ): void {
     if (!this.messagesEl) return;
-    const message = this.messagesEl.createDiv({
-      cls: `ai-autocomplete-chat-message is-assistant${
-        streaming ? " is-streaming" : ""
-      }`,
-    });
+
+    let className = "ai-autocomplete-chat-message is-assistant";
+    if (streaming) className += " is-streaming";
+
+    const message = this.messagesEl.createDiv({ cls: className });
     message.createDiv({
       cls: "ai-autocomplete-chat-role",
       text: "AI",
@@ -528,7 +597,10 @@ export class DiscussionSidebarView extends ItemView {
         cls: "ai-autocomplete-chat-content",
         text: content,
       });
-    } else if (streaming) {
+      return;
+    }
+
+    if (streaming) {
       message.createDiv({
         cls: "ai-autocomplete-chat-content is-placeholder",
         text: tr(language, "等待回答…", "Waiting for answer…"),
@@ -541,14 +613,19 @@ export class DiscussionSidebarView extends ItemView {
     language: UiLanguage
   ): void {
     if (!this.statusEl) return;
+
     this.statusEl.empty();
     this.statusEl.toggleClass("is-visible", snapshot.status !== "idle");
 
     if (snapshot.status === "thinking") {
       this.statusEl.createSpan({ text: tr(language, "思考中…", "Thinking…") });
-    } else if (snapshot.status === "generating") {
+      return;
+    }
+    if (snapshot.status === "generating") {
       this.statusEl.createSpan({ text: tr(language, "生成中…", "Generating…") });
-    } else if (snapshot.status === "error") {
+      return;
+    }
+    if (snapshot.status === "error") {
       this.statusEl.createSpan({
         cls: "ai-autocomplete-chat-error",
         text: snapshot.error || tr(language, "请求失败", "Request failed"),
@@ -559,6 +636,7 @@ export class DiscussionSidebarView extends ItemView {
   private async submit(): Promise<void> {
     const input = this.inputEl;
     if (!input) return;
+
     const question = input.value.trim();
     if (!question) return;
 
@@ -567,4 +645,21 @@ export class DiscussionSidebarView extends ItemView {
     this.refresh();
     this.focusInput();
   }
+}
+
+function isBusyStatus(status: DiscussionRunStatus): boolean {
+  return status === "thinking" || status === "generating";
+}
+
+function createModelControl(
+  slot: HTMLElement,
+  useTextInput: boolean
+): HTMLSelectElement | HTMLInputElement {
+  if (useTextInput) {
+    return slot.createEl("input", {
+      cls: "ai-autocomplete-control-model-input",
+      attr: { type: "text" },
+    });
+  }
+  return slot.createEl("select");
 }
