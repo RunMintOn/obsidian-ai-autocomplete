@@ -1,6 +1,7 @@
-.groq-copilot-ghost-text {
-  opacity: 0.4;
-  font-style: italic;
+.ai-autocomplete-ghost-text {
+  color: var(--text-faint);
+  opacity: 0.75;
   pointer-events: none;
-  color: var(--text-muted);
+  user-select: none;
+  white-space: pre-wrap;
 }
