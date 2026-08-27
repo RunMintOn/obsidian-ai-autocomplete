@@ -12,6 +12,18 @@ Pause briefly while typing and a muted suggestion appears inline.
 - If you keep typing text that matches the suggestion, the matching prefix is consumed and only the remaining ghost text stays visible.
 - Chinese/Japanese/Korean IME composition is handled separately so the ghost does not fight the operating system's composition range.
 
+Automatic completion can be turned off without disabling manual completion. Use the Obsidian command **AI Autocomplete: Trigger inline suggestion** and assign any shortcut from **Settings → Hotkeys**.
+
+## Eagerness
+
+Automatic completion has a 1–5 eagerness setting:
+
+- **1** — conservative: waits longer and requires more context.
+- **3** — balanced default.
+- **5** — eager: triggers quickly with very little preceding text.
+
+Eagerness only changes automatic trigger timing and minimum-context thresholds. It does not change model generation parameters, and manual trigger bypasses the automatic threshold.
+
 ## Provider setup
 
 The plugin intentionally has one provider contract: OpenAI-compatible `POST /chat/completions`.
@@ -24,6 +36,22 @@ Configure:
 
 This keeps the plugin compatible with OpenAI, OpenRouter, Groq-compatible gateways, LM Studio, vLLM, and other servers that expose the standard Chat Completions shape.
 
+## Prompt templates
+
+Prompt templates only contain a name and a system prompt. Provider/model settings stay global.
+
+The settings page supports:
+
+- selecting the active template
+- creating a new template
+- duplicating a template
+- renaming a template
+- deleting a template
+- editing the full system prompt
+- resetting the current prompt to the built-in default
+
+Older saved `systemPrompt` settings are migrated into the default template automatically.
+
 ## Completion behavior
 
 The plugin sends a fill-in-the-middle style prompt containing text before and after the cursor. The provider itself does not need a native FIM API.
@@ -33,7 +61,7 @@ Default context window sent per request:
 - up to 2400 characters before the cursor
 - up to 600 characters after the cursor
 
-The request is triggered after a configurable idle delay (650 ms by default). Results are only displayed when the document and cursor are still at the position that initiated the request, so stale completions cannot overwrite newer typing.
+Results are only displayed when the document and cursor are still at the position that initiated the request, so stale completions cannot overwrite newer typing.
 
 Normal model output is not trimmed before insertion. Leading spaces and newlines are preserved because they may be required for correct inline completion.
 
@@ -45,7 +73,7 @@ The command palette exposes:
 - Accept inline suggestion
 - Accept next suggestion segment
 - Dismiss inline suggestion
-- Toggle auto-completion
+- Toggle automatic completion
 - Test provider connection
 
 ## Development
