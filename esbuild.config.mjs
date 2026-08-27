@@ -4,7 +4,7 @@ import process from "process";
 const prod = process.argv[2] === "production";
 
 esbuild.build({
-  entryPoints: ["src/main.ts"],
+  entryPoints: ["src/plugin.ts"],
   bundle: true,
   external: [
     "obsidian",
