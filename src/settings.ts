@@ -14,8 +14,8 @@ export interface AIAutocompleteSettings {
   autoEnabled: boolean;
   eagerness: number;
   providerId: string;
-  apiKey: string;
-  model: string;
+  providerApiKeys: Record<string, string>;
+  providerModels: Record<string, string>;
   baseUrl: string;
   temperature: number;
   maxTokens: number;
@@ -34,6 +34,8 @@ type LegacySettings = Partial<AIAutocompleteSettings> & {
   systemPrompt?: string;
   delay?: number;
   minPrefixChars?: number;
+  apiKey?: string;
+  model?: string;
 };
 
 export const DEFAULT_API_BASE_URL = "https://api.openai.com/v1";
@@ -43,8 +45,8 @@ export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
   autoEnabled: true,
   eagerness: 3,
   providerId: "openai",
-  apiKey: "",
-  model: "gpt-4o-mini",
+  providerApiKeys: {},
+  providerModels: { openai: "gpt-4o-mini" },
   baseUrl: DEFAULT_API_BASE_URL,
   temperature: 0.2,
   maxTokens: 256,
@@ -65,7 +67,7 @@ export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
 };
 
 export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
-  const loaded = ((raw ?? {}) as LegacySettings);
+  const loaded = (raw ?? {}) as LegacySettings;
   const legacyPrompt = loaded.systemPrompt?.trim();
   const promptTemplates = normalizeTemplates(
     loaded.promptTemplates,
@@ -85,12 +87,24 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
       ? "openai"
       : "custom");
 
+  const providerApiKeys = normalizeStringMap(loaded.providerApiKeys);
+  const providerModels = normalizeStringMap(loaded.providerModels);
+
+  if (loaded.apiKey?.trim() && !providerApiKeys[providerId]) {
+    providerApiKeys[providerId] = loaded.apiKey.trim();
+  }
+  if (loaded.model?.trim() && !providerModels[providerId]) {
+    providerModels[providerId] = loaded.model.trim();
+  }
+
   return {
     ...DEFAULT_SETTINGS,
     ...loaded,
     autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? true,
     eagerness: normalizeEagerness(loaded.eagerness ?? 3),
     providerId,
+    providerApiKeys,
+    providerModels,
     baseUrl,
     maxTokens: normalizeTokenBudget(loaded.maxTokens, DEFAULT_SETTINGS.maxTokens),
     discussionMaxTokens: normalizeTokenBudget(
@@ -118,6 +132,34 @@ export function getActivePromptTemplate(
       (template) => template.id === settings.activePromptTemplateId
     ) ?? settings.promptTemplates[0]
   );
+}
+
+export function getProviderApiKey(settings: AIAutocompleteSettings): string {
+  return settings.providerApiKeys[settings.providerId] ?? "";
+}
+
+export function setProviderApiKey(
+  settings: AIAutocompleteSettings,
+  value: string
+): void {
+  settings.providerApiKeys = {
+    ...settings.providerApiKeys,
+    [settings.providerId]: value,
+  };
+}
+
+export function getProviderModel(settings: AIAutocompleteSettings): string {
+  return settings.providerModels[settings.providerId] ?? "";
+}
+
+export function setProviderModel(
+  settings: AIAutocompleteSettings,
+  value: string
+): void {
+  settings.providerModels = {
+    ...settings.providerModels,
+    [settings.providerId]: value,
+  };
 }
 
 export function normalizeEagerness(value: number): number {
@@ -191,6 +233,15 @@ function normalizeTemplates(
           prompt: fallbackPrompt,
         },
       ];
+}
+
+function normalizeStringMap(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const output: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === "string") output[key] = entry;
+  }
+  return output;
 }
 
 function normalizeUrl(value: string): string {
