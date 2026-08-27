@@ -25,32 +25,53 @@ import {
   fetchCompletion,
 } from "./openai-client";
 
+interface PromptTemplate {
+  id: string;
+  name: string;
+  prompt: string;
+}
+
 interface AIAutocompleteSettings {
-  enabled: boolean;
+  autoEnabled: boolean;
+  eagerness: number;
   apiKey: string;
   model: string;
   baseUrl: string;
-  systemPrompt: string;
   temperature: number;
   maxTokens: number;
-  delay: number;
-  minPrefixChars: number;
   maxPrefixChars: number;
   maxSuffixChars: number;
+  promptTemplates: PromptTemplate[];
+  activePromptTemplateId: string;
 }
 
+type LegacySettings = Partial<AIAutocompleteSettings> & {
+  enabled?: boolean;
+  systemPrompt?: string;
+  delay?: number;
+  minPrefixChars?: number;
+};
+
+const DEFAULT_TEMPLATE_ID = "default";
+
 const DEFAULT_SETTINGS: AIAutocompleteSettings = {
-  enabled: true,
+  autoEnabled: true,
+  eagerness: 3,
   apiKey: "",
   model: "gpt-4o-mini",
   baseUrl: DEFAULT_API_BASE_URL,
-  systemPrompt: DEFAULT_SYSTEM_PROMPT,
   temperature: 0.2,
   maxTokens: 96,
-  delay: 650,
-  minPrefixChars: 3,
   maxPrefixChars: 2400,
   maxSuffixChars: 600,
+  promptTemplates: [
+    {
+      id: DEFAULT_TEMPLATE_ID,
+      name: "Default",
+      prompt: DEFAULT_SYSTEM_PROMPT,
+    },
+  ],
+  activePromptTemplateId: DEFAULT_TEMPLATE_ID,
 };
 
 export default class AIAutocompletePlugin extends Plugin {
@@ -63,7 +84,6 @@ export default class AIAutocompletePlugin extends Plugin {
 
     this.editorExtensions = inlineSuggestionExtension(
       async ({ prefix, suffix, signal }) => {
-        if (!this.settings.enabled) return null;
         try {
           return await fetchCompletion(
             this.getCompletionOptions(),
@@ -91,7 +111,7 @@ export default class AIAutocompletePlugin extends Plugin {
       name: "Trigger inline suggestion",
       editorCallback: (editor) => {
         const view = cmOf(editor);
-        if (view) void getSuggestionManager(view)?.request();
+        if (view) void getSuggestionManager(view)?.request(true);
       },
     });
 
@@ -114,14 +134,16 @@ export default class AIAutocompletePlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "toggle",
-      name: "Toggle auto-completion",
+      id: "toggle-auto",
+      name: "Toggle automatic completion",
       callback: () => {
-        this.settings.enabled = !this.settings.enabled;
-        if (!this.settings.enabled) clearAllSuggestions();
+        this.settings.autoEnabled = !this.settings.autoEnabled;
+        if (!this.settings.autoEnabled) clearAllSuggestions();
         void this.saveSettings();
         new Notice(
-          `AI autocomplete: ${this.settings.enabled ? "on" : "off"}`
+          `AI autocomplete: automatic completion ${
+            this.settings.autoEnabled ? "on" : "off"
+          }`
         );
       },
     });
@@ -134,11 +156,28 @@ export default class AIAutocompletePlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign(
-      {},
-      DEFAULT_SETTINGS,
-      (await this.loadData()) as Partial<AIAutocompleteSettings>
+    const loaded = ((await this.loadData()) ?? {}) as LegacySettings;
+
+    const legacyPrompt = loaded.systemPrompt?.trim();
+    const promptTemplates = normalizeTemplates(
+      loaded.promptTemplates,
+      legacyPrompt || DEFAULT_SYSTEM_PROMPT
     );
+
+    const activePromptTemplateId = promptTemplates.some(
+      (template) => template.id === loaded.activePromptTemplateId
+    )
+      ? (loaded.activePromptTemplateId as string)
+      : promptTemplates[0].id;
+
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loaded,
+      autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? true,
+      eagerness: normalizeEagerness(loaded.eagerness ?? 3),
+      promptTemplates,
+      activePromptTemplateId,
+    };
   }
 
   async saveSettings(): Promise<void> {
@@ -147,12 +186,19 @@ export default class AIAutocompletePlugin extends Plugin {
 
   getInlineConfig(): InlineSuggestionConfig {
     return {
-      enabled: this.settings.enabled,
-      delay: this.settings.delay,
-      minPrefixChars: this.settings.minPrefixChars,
+      autoEnabled: this.settings.autoEnabled,
+      eagerness: this.settings.eagerness,
       maxPrefixChars: this.settings.maxPrefixChars,
       maxSuffixChars: this.settings.maxSuffixChars,
     };
+  }
+
+  getActivePromptTemplate(): PromptTemplate {
+    return (
+      this.settings.promptTemplates.find(
+        (template) => template.id === this.settings.activePromptTemplateId
+      ) ?? this.settings.promptTemplates[0]
+    );
   }
 
   getCompletionOptions(): CompletionRequestOptions {
@@ -160,7 +206,7 @@ export default class AIAutocompletePlugin extends Plugin {
       apiKey: this.settings.apiKey,
       model: this.settings.model,
       baseUrl: this.settings.baseUrl,
-      systemPrompt: this.settings.systemPrompt,
+      systemPrompt: this.getActivePromptTemplate().prompt,
       temperature: this.settings.temperature,
       maxTokens: this.settings.maxTokens,
     };
@@ -209,15 +255,41 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
     containerEl.empty();
     const settings = this.plugin.settings;
 
+    new Setting(containerEl).setName("General").setHeading();
+
     new Setting(containerEl)
-      .setName("Enabled")
-      .setDesc("Show inline suggestions automatically while typing.")
+      .setName("Automatic completion")
+      .setDesc(
+        "Show suggestions automatically after you pause typing. Manual trigger remains available when this is off."
+      )
       .addToggle((toggle) =>
-        toggle.setValue(settings.enabled).onChange(async (value) => {
-          settings.enabled = value;
+        toggle.setValue(settings.autoEnabled).onChange(async (value) => {
+          settings.autoEnabled = value;
           if (!value) clearAllSuggestions();
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Eagerness")
+      .setDesc(
+        "How aggressively automatic completion triggers. 1 = conservative, 3 = balanced, 5 = eager."
+      )
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 5, 1)
+          .setValue(settings.eagerness)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            settings.eagerness = normalizeEagerness(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Manual trigger")
+      .setDesc(
+        "Command: “AI Autocomplete: Trigger inline suggestion”. Assign any shortcut in Obsidian Settings → Hotkeys."
       );
 
     new Setting(containerEl).setName("Provider").setHeading();
@@ -274,20 +346,6 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Completion").setHeading();
 
     new Setting(containerEl)
-      .setName("Trigger delay")
-      .setDesc("Idle time after typing before requesting a suggestion.")
-      .addSlider((slider) =>
-        slider
-          .setLimits(200, 2000, 50)
-          .setValue(settings.delay)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            settings.delay = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Maximum tokens")
       .setDesc("Keep this low for fast, concise inline suggestions.")
       .addSlider((slider) =>
@@ -315,32 +373,158 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl).setName("Prompt templates").setHeading();
+
+    const activeTemplate = this.plugin.getActivePromptTemplate();
+
+    new Setting(containerEl)
+      .setName("Active template")
+      .setDesc("Only the active template's system prompt is sent to the model.")
+      .addDropdown((dropdown) => {
+        for (const template of settings.promptTemplates) {
+          dropdown.addOption(template.id, template.name);
+        }
+        dropdown
+          .setValue(activeTemplate.id)
+          .onChange(async (value) => {
+            settings.activePromptTemplateId = value;
+            await this.plugin.saveSettings();
+            this.display();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Template actions")
+      .setDesc("Create, copy, or remove prompt templates.")
+      .addButton((button) =>
+        button.setButtonText("New").onClick(async () => {
+          const template: PromptTemplate = {
+            id: createTemplateId(),
+            name: uniqueTemplateName(settings.promptTemplates, "New template"),
+            prompt: DEFAULT_SYSTEM_PROMPT,
+          };
+          settings.promptTemplates.push(template);
+          settings.activePromptTemplateId = template.id;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("Duplicate").onClick(async () => {
+          const template: PromptTemplate = {
+            id: createTemplateId(),
+            name: uniqueTemplateName(
+              settings.promptTemplates,
+              `${activeTemplate.name} copy`
+            ),
+            prompt: activeTemplate.prompt,
+          };
+          settings.promptTemplates.push(template);
+          settings.activePromptTemplateId = template.id;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) => {
+        button
+          .setButtonText("Delete")
+          .setDisabled(settings.promptTemplates.length <= 1)
+          .onClick(async () => {
+            if (settings.promptTemplates.length <= 1) return;
+            settings.promptTemplates = settings.promptTemplates.filter(
+              (template) => template.id !== activeTemplate.id
+            );
+            settings.activePromptTemplateId = settings.promptTemplates[0].id;
+            await this.plugin.saveSettings();
+            this.display();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Template name")
+      .setDesc("Rename the active prompt template.")
+      .addText((text) =>
+        text
+          .setValue(activeTemplate.name)
+          .onChange(async (value) => {
+            const trimmed = value.trim();
+            if (!trimmed) return;
+            activeTemplate.name = trimmed;
+            await this.plugin.saveSettings();
+          })
+      );
+
     new Setting(containerEl)
       .setName("System prompt")
-      .setDesc("Instructions used for every inline completion request.")
+      .setDesc("Editable instructions for the active template.")
       .addTextArea((text) => {
-        text.inputEl.rows = 12;
+        text.inputEl.rows = 14;
         text.inputEl.cols = 60;
         text
           .setPlaceholder(DEFAULT_SYSTEM_PROMPT)
-          .setValue(settings.systemPrompt)
+          .setValue(activeTemplate.prompt)
           .onChange(async (value) => {
-            settings.systemPrompt = value;
+            activeTemplate.prompt = value;
             await this.plugin.saveSettings();
           });
       });
 
     new Setting(containerEl)
-      .setName("Reset prompt")
-      .setDesc("Restore the built-in inline-completion prompt.")
+      .setName("Reset current template")
+      .setDesc("Replace this template's prompt with the built-in default.")
       .addButton((button) =>
-        button.setButtonText("Reset").onClick(async () => {
-          settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+        button.setButtonText("Reset prompt").onClick(async () => {
+          activeTemplate.prompt = DEFAULT_SYSTEM_PROMPT;
           await this.plugin.saveSettings();
           this.display();
         })
       );
   }
+}
+
+function normalizeTemplates(
+  templates: PromptTemplate[] | undefined,
+  fallbackPrompt: string
+): PromptTemplate[] {
+  if (!Array.isArray(templates) || templates.length === 0) {
+    return [
+      {
+        id: DEFAULT_TEMPLATE_ID,
+        name: "Default",
+        prompt: fallbackPrompt,
+      },
+    ];
+  }
+
+  return templates
+    .filter(
+      (template) =>
+        template &&
+        typeof template.id === "string" &&
+        typeof template.name === "string" &&
+        typeof template.prompt === "string"
+    )
+    .map((template) => ({ ...template }));
+}
+
+function normalizeEagerness(value: number): number {
+  return Math.min(5, Math.max(1, Math.round(value)));
+}
+
+function createTemplateId(): string {
+  return `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function uniqueTemplateName(
+  templates: PromptTemplate[],
+  preferredName: string
+): string {
+  const names = new Set(templates.map((template) => template.name));
+  if (!names.has(preferredName)) return preferredName;
+
+  let index = 2;
+  while (names.has(`${preferredName} ${index}`)) index += 1;
+  return `${preferredName} ${index}`;
 }
 
 function cmOf(editor: Editor): EditorView | null {
