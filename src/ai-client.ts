@@ -1,4 +1,3 @@
-import { requestUrl } from "obsidian";
 import {
   contentText,
   createProvider,
@@ -10,6 +9,7 @@ import {
   type SimpleStreamOptions,
   type ThinkingLevel,
 } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { cerebrasProvider } from "@earendil-works/pi-ai/providers/cerebras";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
@@ -23,7 +23,7 @@ import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { togetherProvider } from "@earendil-works/pi-ai/providers/together";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { zaiProvider } from "@earendil-works/pi-ai/providers/zai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { providerFetch } from "./transport";
 
 export const NO_SUGGESTION = "NO_SUGGESTION";
 
@@ -158,7 +158,7 @@ export async function streamChatCompletion(
       temperature: options.temperature,
       maxTokens: Math.min(options.maxTokens, model.maxTokens || options.maxTokens),
       maxRetries: 0,
-      fetch: transportFetch,
+      fetch: providerFetch,
     };
 
     const apiKey = options.apiKey.trim();
@@ -424,81 +424,4 @@ function abortError(): Error {
   const error = new Error("Completion request aborted");
   error.name = "AbortError";
   return error;
-}
-
-async function transportFetch(
-  input: RequestInfo | URL,
-  init?: RequestInit
-): Promise<Response> {
-  // Obsidian desktop runs inside Electron. net.fetch returns a real streaming
-  // Response and avoids renderer CORS, which lets pi-ai emit text deltas as
-  // they arrive. requestUrl remains the non-streaming fallback (e.g. mobile).
-  try {
-    const electron = require("electron") as {
-      net?: {
-        fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-      };
-    };
-    if (electron.net?.fetch) return await electron.net.fetch(input, init);
-  } catch {
-    // Fall through to Obsidian's buffered transport.
-  }
-
-  return bufferedObsidianFetch(input, init);
-}
-
-async function bufferedObsidianFetch(
-  input: RequestInfo | URL,
-  init?: RequestInit
-): Promise<Response> {
-  const request = input instanceof Request ? input : null;
-  const url =
-    typeof input === "string"
-      ? input
-      : input instanceof URL
-        ? input.toString()
-        : input.url;
-
-  const signal = init?.signal ?? request?.signal;
-  if (signal?.aborted) throw abortError();
-
-  const headers = new Headers(request?.headers);
-  if (init?.headers) {
-    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-  }
-  const headerRecord: Record<string, string> = {};
-  headers.forEach((value, key) => {
-    headerRecord[key] = value;
-  });
-
-  let body: string | ArrayBuffer | undefined;
-  const suppliedBody = init?.body;
-  if (typeof suppliedBody === "string") {
-    body = suppliedBody;
-  } else if (suppliedBody instanceof ArrayBuffer) {
-    body = suppliedBody;
-  } else if (ArrayBuffer.isView(suppliedBody)) {
-    body = suppliedBody.buffer.slice(
-      suppliedBody.byteOffset,
-      suppliedBody.byteOffset + suppliedBody.byteLength
-    ) as ArrayBuffer;
-  } else if (!suppliedBody && request && !["GET", "HEAD"].includes(request.method)) {
-    body = await request.clone().arrayBuffer();
-  } else if (suppliedBody != null) {
-    throw new CompletionError("Unsupported request body from pi-ai transport");
-  }
-
-  const response = await requestUrl({
-    url,
-    method: init?.method ?? request?.method ?? "GET",
-    headers: headerRecord,
-    body,
-    throw: false,
-  });
-
-  if (signal?.aborted) throw abortError();
-  return new Response(response.arrayBuffer, {
-    status: response.status,
-    headers: response.headers,
-  });
 }
