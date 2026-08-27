@@ -1,235 +1,507 @@
 import {
+  Decoration,
+  EditorView,
+  keymap,
   ViewPlugin,
   ViewUpdate,
-  EditorView,
-  Decoration,
-  DecorationSet,
   WidgetType,
-  keymap,
 } from "@codemirror/view";
 import {
+  EditorState,
+  Prec,
   StateEffect,
   StateField,
   Text,
-  Prec,
-  EditorState,
-  EditorSelection,
-  TransactionSpec,
 } from "@codemirror/state";
 
-// --- State Management ---
+export interface InlineSuggestion {
+  from: number;
+  text: string;
+}
 
-export const InlineSuggestionEffect = StateEffect.define<{
-  text: string | null;
-  doc: Text;
-}>();
+interface CompositionSnapshot {
+  suggestion: InlineSuggestion;
+  before: string;
+  after: string;
+}
 
-export const ClearSuggestionEffect = StateEffect.define<null>();
+export interface CompletionContext {
+  prefix: string;
+  suffix: string;
+  state: EditorState;
+  signal: AbortSignal;
+}
 
-export const InlineSuggestionState = StateField.define<{
-  suggestion: string | null;
-}>({
-  create() {
-    return { suggestion: null };
-  },
+export interface InlineSuggestionConfig {
+  autoEnabled: boolean;
+  eagerness: number;
+  maxPrefixChars: number;
+  maxSuffixChars: number;
+}
+
+interface TriggerPolicy {
+  delay: number;
+  minPrefixChars: number;
+}
+
+export type FetchFn = (context: CompletionContext) => Promise<string | null>;
+export type GetConfig = () => InlineSuggestionConfig;
+
+const setSuggestionEffect = StateEffect.define<InlineSuggestion | null>();
+
+export const InlineSuggestionState = StateField.define<InlineSuggestion | null>({
+  create: () => null,
   update(value, tr) {
-    // Explicit clear
     for (const effect of tr.effects) {
-      if (effect.is(ClearSuggestionEffect)) {
-        return { suggestion: null };
-      }
+      if (effect.is(setSuggestionEffect)) return effect.value;
     }
 
-    // New suggestion arrived
-    for (const effect of tr.effects) {
-      if (effect.is(InlineSuggestionEffect)) {
-        // Only accept if doc hasn't changed since request
-        if (tr.state.doc === effect.value.doc) {
-          return { suggestion: effect.value.text };
+    if (!value) return null;
+
+    let candidate: InlineSuggestion | null = value;
+
+    if (tr.docChanged) {
+      let consumed = "";
+      let pureInsertionAtAnchor = true;
+
+      tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted: Text) => {
+        if (!pureInsertionAtAnchor) return;
+        if (fromA !== toA || fromA !== value.from) {
+          pureInsertionAtAnchor = false;
+          return;
         }
+        consumed += inserted.toString();
+      });
+
+      if (!pureInsertionAtAnchor) return null;
+
+      if (consumed.length > 0) {
+        if (!value.text.startsWith(consumed)) return null;
+        const remaining = value.text.slice(consumed.length);
+        candidate = remaining
+          ? { from: value.from + consumed.length, text: remaining }
+          : null;
+      } else {
+        candidate = {
+          from: tr.changes.mapPos(value.from, 1),
+          text: value.text,
+        };
       }
     }
 
-    // Any doc change or cursor move clears suggestion
-    if (tr.docChanged || tr.selection) {
-      return { suggestion: null };
+    if (candidate && tr.selection) {
+      const selection = tr.selection.main;
+      if (!selection.empty || selection.head !== candidate.from) return null;
     }
 
-    return value;
+    return candidate;
   },
+  provide: (field) =>
+    EditorView.decorations.from(field, (suggestion) => {
+      if (!suggestion?.text) return Decoration.none;
+      return Decoration.set([
+        Decoration.widget({
+          widget: new GhostTextWidget(suggestion.text),
+          side: 1,
+        }).range(suggestion.from),
+      ]);
+    }),
 });
-
-// --- Ghost Text Widget ---
 
 class GhostTextWidget extends WidgetType {
   constructor(readonly text: string) {
     super();
   }
 
-  eq(other: GhostTextWidget) {
+  eq(other: GhostTextWidget): boolean {
     return other.text === this.text;
   }
 
-  toDOM() {
+  toDOM(): HTMLElement {
     const span = document.createElement("span");
-    span.className = "groq-copilot-ghost-text";
+    span.className = "ai-autocomplete-ghost-text";
     span.textContent = this.text;
     return span;
   }
 
-  get lineBreaks() {
+  get lineBreaks(): number {
     return this.text.split("\n").length - 1;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
   }
 }
 
-// --- Render Plugin ---
+function currentSuggestion(view: EditorView): InlineSuggestion | null {
+  return view.state.field(InlineSuggestionState, false) ?? null;
+}
 
-const renderGhostTextPlugin = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet = Decoration.none;
+function setSuggestion(
+  view: EditorView,
+  suggestion: InlineSuggestion | null
+): void {
+  view.dispatch({ effects: setSuggestionEffect.of(suggestion) });
+}
 
-    update(update: ViewUpdate) {
-      const suggestion =
-        update.state.field(InlineSuggestionState)?.suggestion;
+function insertPortion(
+  view: EditorView,
+  suggestion: InlineSuggestion,
+  take: number
+): boolean {
+  const part = suggestion.text.slice(0, take);
+  if (!part) return false;
 
-      if (!suggestion) {
-        this.decorations = Decoration.none;
+  const rest = suggestion.text.slice(take);
+  const nextFrom = suggestion.from + part.length;
+
+  view.dispatch({
+    changes: { from: suggestion.from, insert: part },
+    selection: { anchor: nextFrom },
+    effects: setSuggestionEffect.of(
+      rest ? { from: nextFrom, text: rest } : null
+    ),
+    userEvent: "input.complete",
+    scrollIntoView: true,
+  });
+  return true;
+}
+
+export function acceptSuggestion(view: EditorView): boolean {
+  const suggestion = currentSuggestion(view);
+  if (!suggestion) return false;
+  return insertPortion(view, suggestion, suggestion.text.length);
+}
+
+export function acceptSuggestionSegment(view: EditorView): boolean {
+  const suggestion = currentSuggestion(view);
+  if (!suggestion) return false;
+  return insertPortion(view, suggestion, nextSegmentLength(suggestion.text));
+}
+
+export function dismissSuggestion(view: EditorView): boolean {
+  if (!currentSuggestion(view)) return false;
+  setSuggestion(view, null);
+  return true;
+}
+
+function nextSegmentLength(text: string): number {
+  if (!text) return 0;
+
+  const leadingWhitespace = /^\s*/.exec(text)?.[0].length ?? 0;
+  const rest = text.slice(leadingWhitespace);
+  if (!rest) return text.length;
+
+  type Segment = { segment: string; isWordLike?: boolean };
+  type Segmenter = {
+    segment(input: string): Iterable<Segment>;
+  };
+  type SegmenterConstructor = new (
+    locales?: string | string[],
+    options?: { granularity: "word" }
+  ) => Segmenter;
+
+  const SegmenterCtor = (
+    Intl as unknown as { Segmenter?: SegmenterConstructor }
+  ).Segmenter;
+
+  if (SegmenterCtor) {
+    const segmenter = new SegmenterCtor(undefined, { granularity: "word" });
+    const first = segmenter.segment(rest)[Symbol.iterator]().next().value as
+      | Segment
+      | undefined;
+    if (first?.segment) return leadingWhitespace + first.segment.length;
+  }
+
+  const fallback = /^\S+/.exec(rest)?.[0] ?? rest[0] ?? "";
+  return leadingWhitespace + fallback.length;
+}
+
+function triggerPolicy(eagerness: number): TriggerPolicy {
+  const level = Math.min(5, Math.max(1, Math.round(eagerness)));
+  switch (level) {
+    case 1:
+      return { delay: 1200, minPrefixChars: 12 };
+    case 2:
+      return { delay: 900, minPrefixChars: 8 };
+    case 4:
+      return { delay: 450, minPrefixChars: 2 };
+    case 5:
+      return { delay: 280, minPrefixChars: 1 };
+    case 3:
+    default:
+      return { delay: 650, minPrefixChars: 4 };
+  }
+}
+
+const managers = new WeakMap<EditorView, SuggestionManager>();
+const activeManagers = new Set<SuggestionManager>();
+
+export function clearAllSuggestions(): void {
+  for (const manager of activeManagers) manager.clear();
+}
+
+export function getSuggestionManager(
+  view: EditorView
+): SuggestionManager | undefined {
+  return managers.get(view);
+}
+
+export class SuggestionManager {
+  private timer: number | null = null;
+  private controller: AbortController | null = null;
+  private composing = false;
+  private compositionSnapshot: CompositionSnapshot | null = null;
+  private compositionFinishTimer: number | null = null;
+
+  constructor(
+    private readonly view: EditorView,
+    private readonly fetchFn: FetchFn,
+    private readonly getConfig: GetConfig
+  ) {
+    managers.set(view, this);
+    activeManagers.add(this);
+  }
+
+  update(update: ViewUpdate): void {
+    const acceptedCompletion = update.transactions.some((tr) =>
+      tr.isUserEvent("input.complete")
+    );
+
+    if (acceptedCompletion) {
+      this.cancelTimer();
+      this.abortRequest();
+      return;
+    }
+
+    if (this.composing || update.view.composing) {
+      this.cancelTimer();
+      this.abortRequest();
+      return;
+    }
+
+    const userEdited = update.transactions.some(
+      (tr) => tr.isUserEvent("input") || tr.isUserEvent("delete")
+    );
+
+    if (userEdited) {
+      this.abortRequest();
+
+      // Matching text was consumed from the existing ghost. Keep it stable
+      // rather than replacing it with a new network result on every keypress.
+      if (currentSuggestion(this.view)) {
+        this.cancelTimer();
         return;
       }
 
-      const pos = update.state.selection.main.head;
-      const widget = Decoration.widget({
-        widget: new GhostTextWidget(suggestion),
-        side: 1,
-      });
-      this.decorations = Decoration.set([widget.range(pos)]);
+      if (this.getConfig().autoEnabled) this.schedule();
+      return;
     }
-  },
-  {
-    decorations: (v) => v.decorations,
+
+    if (update.selectionSet && !update.docChanged) {
+      this.cancelTimer();
+      this.abortRequest();
+    }
   }
-);
 
-// --- Key Bindings ---
+  onCompositionStart(): void {
+    if (this.composing) return;
+    this.composing = true;
+    this.cancelTimer();
+    this.abortRequest();
 
-function insertCompletionText(
-  state: EditorState,
-  text: string,
-  from: number,
-  to: number
-): TransactionSpec {
-  return {
-    ...state.changeByRange((range) => {
-      if (range === state.selection.main) {
-        return {
-          changes: { from, to, insert: text },
-          range: EditorSelection.cursor(from + text.length),
-        };
+    const suggestion = currentSuggestion(this.view);
+    if (!suggestion) {
+      this.compositionSnapshot = null;
+      return;
+    }
+
+    const doc = this.view.state.doc.toString();
+    this.compositionSnapshot = {
+      suggestion,
+      before: doc.slice(0, suggestion.from),
+      after: doc.slice(suggestion.from),
+    };
+
+    // Hide the widget while the OS IME owns the composition range. We restore
+    // the unconsumed remainder after compositionend when it still matches.
+    setSuggestion(this.view, null);
+  }
+
+  onCompositionEnd(): void {
+    if (this.compositionFinishTimer !== null) {
+      window.clearTimeout(this.compositionFinishTimer);
+    }
+
+    // Let CodeMirror apply the final composition transaction first.
+    this.compositionFinishTimer = window.setTimeout(() => {
+      this.compositionFinishTimer = null;
+      this.finishComposition();
+    }, 0);
+  }
+
+  private finishComposition(): void {
+    this.composing = false;
+
+    const snapshot = this.compositionSnapshot;
+    this.compositionSnapshot = null;
+
+    if (snapshot) {
+      const doc = this.view.state.doc.toString();
+      const { before, after, suggestion } = snapshot;
+
+      if (
+        doc.startsWith(before) &&
+        doc.endsWith(after) &&
+        doc.length >= before.length + after.length
+      ) {
+        const inserted = doc.slice(before.length, doc.length - after.length);
+
+        if (suggestion.text.startsWith(inserted)) {
+          const remaining = suggestion.text.slice(inserted.length);
+          if (remaining) {
+            setSuggestion(this.view, {
+              from: suggestion.from + inserted.length,
+              text: remaining,
+            });
+            return;
+          }
+        }
       }
-      return { range };
-    }),
-    userEvent: "input.complete",
-  };
+    }
+
+    if (this.getConfig().autoEnabled) this.schedule();
+  }
+
+  schedule(): void {
+    this.cancelTimer();
+    const config = this.getConfig();
+    if (!config.autoEnabled) return;
+    const delay = triggerPolicy(config.eagerness).delay;
+    this.timer = window.setTimeout(() => {
+      this.timer = null;
+      void this.request(false);
+    }, delay);
+  }
+
+  async request(manual = false): Promise<void> {
+    const config = this.getConfig();
+    if ((!manual && !config.autoEnabled) || this.composing || this.view.composing) {
+      return;
+    }
+    if (currentSuggestion(this.view)) return;
+
+    const selection = this.view.state.selection.main;
+    if (!selection.empty) return;
+
+    const cursor = selection.head;
+    const doc = this.view.state.doc;
+    const prefix = doc.sliceString(
+      Math.max(0, cursor - config.maxPrefixChars),
+      cursor
+    );
+    const suffix = doc.sliceString(
+      cursor,
+      Math.min(doc.length, cursor + config.maxSuffixChars)
+    );
+
+    if (manual) {
+      if (!prefix.trim() && !suffix.trim()) return;
+    } else {
+      const policy = triggerPolicy(config.eagerness);
+      if (prefix.trim().length < policy.minPrefixChars) return;
+    }
+
+    this.cancelTimer();
+    this.abortRequest();
+    const controller = new AbortController();
+    this.controller = controller;
+
+    try {
+      const result = await this.fetchFn({
+        prefix,
+        suffix,
+        state: this.view.state,
+        signal: controller.signal,
+      });
+
+      if (controller.signal.aborted || !result || !result.trim()) return;
+      if (!manual && !this.getConfig().autoEnabled) return;
+      if (this.view.state.doc !== doc) return;
+
+      const currentSelection = this.view.state.selection.main;
+      if (!currentSelection.empty || currentSelection.head !== cursor) return;
+      if (this.composing || this.view.composing) return;
+
+      setSuggestion(this.view, { from: cursor, text: result });
+    } finally {
+      if (this.controller === controller) this.controller = null;
+    }
+  }
+
+  clear(): void {
+    this.cancelTimer();
+    this.abortRequest();
+    this.compositionSnapshot = null;
+    if (currentSuggestion(this.view)) setSuggestion(this.view, null);
+  }
+
+  destroy(): void {
+    this.clear();
+    if (this.compositionFinishTimer !== null) {
+      window.clearTimeout(this.compositionFinishTimer);
+      this.compositionFinishTimer = null;
+    }
+    managers.delete(this.view);
+    activeManagers.delete(this);
+  }
+
+  private cancelTimer(): void {
+    if (this.timer !== null) {
+      window.clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private abortRequest(): void {
+    if (this.controller) {
+      this.controller.abort();
+      this.controller = null;
+    }
+  }
 }
 
 const ghostTextKeymap = Prec.highest(
   keymap.of([
-    {
-      key: "Tab",
-      run: (view: EditorView) => {
-        const suggestion =
-          view.state.field(InlineSuggestionState)?.suggestion;
-        if (!suggestion) return false;
-
-        const head = view.state.selection.main.head;
-        view.dispatch(insertCompletionText(view.state, suggestion, head, head));
-        return true;
-      },
-    },
-    {
-      key: "Escape",
-      run: (view: EditorView) => {
-        const suggestion =
-          view.state.field(InlineSuggestionState)?.suggestion;
-        if (!suggestion) return false;
-
-        view.dispatch({ effects: ClearSuggestionEffect.of(null) });
-        return true;
-      },
-    },
+    { key: "Tab", run: acceptSuggestion },
+    { key: "Escape", run: dismissSuggestion },
+    { key: "Mod-ArrowRight", run: acceptSuggestionSegment },
   ])
 );
 
-// --- Fetch Plugin (triggers AI completion) ---
+const compositionHandlers = EditorView.domEventHandlers({
+  compositionstart: (_event, view) => {
+    getSuggestionManager(view)?.onCompositionStart();
+    return false;
+  },
+  compositionend: (_event, view) => {
+    getSuggestionManager(view)?.onCompositionEnd();
+    return false;
+  },
+});
 
-export type FetchFn = (
-  prefix: string,
-  suffix: string,
-  state: EditorState
-) => Promise<string | null>;
-
-export function createFetchPlugin(fetchFn: FetchFn, delay: number) {
-  return ViewPlugin.fromClass(
-    class {
-      private timer: ReturnType<typeof setTimeout> | null = null;
-      private abortController: AbortController | null = null;
-
-      update(update: ViewUpdate) {
-        if (!update.docChanged) return;
-
-        // Cancel pending request
-        if (this.timer) clearTimeout(this.timer);
-        if (this.abortController) this.abortController.abort();
-
-        this.timer = setTimeout(() => {
-          void (async () => {
-            const doc = update.state.doc;
-            const cursor = update.state.selection.main.head;
-            const fullText = doc.toString();
-
-            const prefix = fullText.slice(Math.max(0, cursor - 2000), cursor);
-            const suffix = fullText.slice(cursor, cursor + 500);
-
-            // Don't trigger on empty or very short prefix
-            if (prefix.trim().length < 3) return;
-
-            this.abortController = new AbortController();
-
-            try {
-              const result = await fetchFn(prefix, suffix, update.state);
-              if (result && result.trim()) {
-                update.view.dispatch({
-                  effects: InlineSuggestionEffect.of({
-                    text: result,
-                    doc,
-                  }),
-                });
-              }
-            } catch (e) {
-              // Silently ignore aborted requests
-              if (e instanceof Error && e.name !== "AbortError") {
-                console.error("Groq Copilot: fetch error", e);
-              }
-            }
-          })();
-        }, delay);
-      }
-
-      destroy() {
-        if (this.timer) clearTimeout(this.timer);
-        if (this.abortController) this.abortController.abort();
-      }
-    }
+export function inlineSuggestionExtension(
+  fetchFn: FetchFn,
+  getConfig: GetConfig
+) {
+  const triggerPlugin = ViewPlugin.define(
+    (view) => new SuggestionManager(view, fetchFn, getConfig)
   );
-}
 
-// --- Public API ---
-
-export function inlineSuggestionExtension(fetchFn: FetchFn, delay = 800) {
   return [
     InlineSuggestionState,
-    createFetchPlugin(fetchFn, delay),
-    renderGhostTextPlugin,
     ghostTextKeymap,
+    compositionHandlers,
+    triggerPlugin,
   ];
 }

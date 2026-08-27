@@ -3,7 +3,7 @@
   "name": "AI Autocomplete",
   "version": "1.0.5",
   "minAppVersion": "0.15.0",
-  "description": "Inline AI writing completion with ghost text. Powered by Groq. Tab to accept.",
+  "description": "Copilot-style inline completion plus a linked AI discussion sidebar, powered by pi-ai providers.",
   "author": "liuyishou",
   "isDesktopOnly": false
 }

@@ -4,11 +4,13 @@ import process from "process";
 const prod = process.argv[2] === "production";
 
 esbuild.build({
-  entryPoints: ["src/main.ts"],
+  entryPoints: ["src/plugin.ts"],
   bundle: true,
   external: [
     "obsidian",
     "electron",
+    "node:http",
+    "node:https",
     "@codemirror/autocomplete",
     "@codemirror/collab",
     "@codemirror/commands",
@@ -22,7 +24,7 @@ esbuild.build({
     "@lezer/lr",
   ],
   format: "cjs",
-  target: "es2018",
+  target: "es2022",
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,

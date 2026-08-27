@@ -1,6 +1,269 @@
-.groq-copilot-ghost-text {
-  opacity: 0.4;
-  font-style: italic;
+.ai-autocomplete-ghost-text {
+  color: var(--text-faint);
+  opacity: 0.75;
   pointer-events: none;
+  user-select: none;
+  white-space: pre-wrap;
+}
+
+.ai-autocomplete-sidebar {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  color: var(--text-normal);
+}
+
+.ai-autocomplete-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 0.75rem 0.55rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.ai-autocomplete-sidebar-title {
+  font-weight: 650;
+}
+
+.ai-autocomplete-sidebar-note {
+  margin-top: 0.15rem;
+  max-width: 18rem;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-autocomplete-sidebar-icon-button {
+  width: auto;
+  padding: 0.25rem 0.45rem;
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-reference-section {
+  padding: 0.65rem 0.75rem 0.6rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.ai-autocomplete-reference-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
   color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+}
+
+.ai-autocomplete-reference-actions {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.ai-autocomplete-reference-actions button {
+  padding: 0.15rem 0.4rem;
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-reference-card {
+  max-height: 9rem;
+  overflow: auto;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.ai-autocomplete-reference-card.is-empty {
+  border-style: dashed;
+  background: transparent;
+}
+
+.ai-autocomplete-reference-text {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.ai-autocomplete-chat-messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.7rem 0.75rem;
+}
+
+.ai-autocomplete-chat-empty {
+  padding: 0.75rem 0.25rem;
+  color: var(--text-faint);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+}
+
+.ai-autocomplete-chat-message {
+  margin-bottom: 0.8rem;
+}
+
+.ai-autocomplete-chat-role {
+  margin-bottom: 0.2rem;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+}
+
+.ai-autocomplete-chat-content {
+  padding: 0.55rem 0.65rem;
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-small);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.ai-autocomplete-chat-content.is-placeholder {
+  color: var(--text-faint);
+}
+
+.ai-autocomplete-chat-message.is-user .ai-autocomplete-chat-content {
+  background: var(--background-secondary-alt);
+}
+
+.ai-autocomplete-chat-message.is-assistant .ai-autocomplete-chat-content {
+  border-left: 2px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.ai-autocomplete-chat-message.is-streaming .ai-autocomplete-chat-content::after {
+  content: "▍";
+  margin-left: 0.08rem;
+  animation: ai-autocomplete-caret 0.9s step-end infinite;
+}
+
+.ai-autocomplete-thinking {
+  margin: 0 0 0.45rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary-alt);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-thinking summary {
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+}
+
+.ai-autocomplete-thinking-content {
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0 0.55rem 0.55rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.ai-autocomplete-chat-message.is-streaming .ai-autocomplete-thinking[open] summary::after {
+  content: " …";
+  animation: ai-autocomplete-pulse 1.25s ease-in-out infinite;
+}
+
+.ai-autocomplete-chat-status {
+  display: none;
+  min-height: 1.7rem;
+  padding: 0.3rem 0.75rem;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-chat-status.is-visible {
+  display: block;
+}
+
+.ai-autocomplete-chat-status.is-visible:not(:has(.ai-autocomplete-chat-error)) {
+  animation: ai-autocomplete-pulse 1.25s ease-in-out infinite;
+}
+
+.ai-autocomplete-chat-error {
+  color: var(--text-error);
+}
+
+.ai-autocomplete-chat-composer {
+  flex: 0 0 auto;
+  padding: 0.6rem 0.75rem 0.75rem;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.ai-autocomplete-chat-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) 5.5rem;
+  gap: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.ai-autocomplete-chat-controls select,
+.ai-autocomplete-chat-controls input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 2rem;
+  padding: 0 0.35rem;
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-control-model {
+  min-width: 0;
+}
+
+.ai-autocomplete-reasoning-hint {
+  min-height: 1.15rem;
+  margin-bottom: 0.35rem;
+  color: var(--text-faint);
+  font-size: 0.72em;
+  line-height: 1.35;
+}
+
+.ai-autocomplete-chat-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 5.5rem;
+  max-height: 14rem;
+  resize: vertical;
+}
+
+.ai-autocomplete-chat-composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  margin-top: 0.45rem;
+}
+
+.ai-autocomplete-chat-hint {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+@media (max-width: 360px) {
+  .ai-autocomplete-chat-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ai-autocomplete-control-tokens {
+    grid-column: span 2;
+  }
+}
+
+@keyframes ai-autocomplete-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+@keyframes ai-autocomplete-caret {
+  0%, 45% { opacity: 1; }
+  46%, 100% { opacity: 0; }
 }
