@@ -5,8 +5,8 @@ import {
   getProviderModels,
   getProviderOptions,
   type ReasoningEffort,
-} from "./ai-client";
-import { tr } from "./i18n";
+} from "./ai-client.js";
+import { tr } from "./i18n.js";
 import {
   type AIAutocompleteSettings,
   createTemplateId,
@@ -15,6 +15,8 @@ import {
   getDiscussionProviderModel,
   getProviderApiKey,
   getProviderModel,
+  MAX_TOKEN_BUDGET,
+  MIN_TOKEN_BUDGET,
   normalizeEagerness,
   normalizeReasoningEffort,
   normalizeTokenBudget,
@@ -22,8 +24,9 @@ import {
   setProviderApiKey,
   setProviderModel,
   type PromptTemplate,
+  type UiLanguage,
   uniqueTemplateName,
-} from "./settings";
+} from "./settings.js";
 
 export interface SettingsHost {
   settings: AIAutocompleteSettings;
@@ -32,6 +35,8 @@ export interface SettingsHost {
   onSettingsChanged?(): void;
 }
 
+type Translator = (zh: string, en: string) => string;
+
 export class AIAutocompleteSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly host: SettingsHost) {
     super(app, host as never);
@@ -39,10 +44,23 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
-    containerEl.empty();
     const settings = this.host.settings;
-    const l = (zh: string, en: string) => tr(settings.uiLanguage, zh, en);
+    const l = createTranslator(settings.uiLanguage);
 
+    containerEl.empty();
+    this.renderInterfaceSection(containerEl, settings, l);
+    this.renderGeneralSection(containerEl, settings, l);
+    this.renderProviderSection(containerEl, settings, l);
+    this.renderCompletionSection(containerEl, settings, l);
+    this.renderPromptTemplatesSection(containerEl, settings, l);
+    this.renderDiscussionSection(containerEl, settings, l);
+  }
+
+  private renderInterfaceSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl).setName(l("界面", "Interface")).setHeading();
 
     new Setting(containerEl)
@@ -65,7 +83,13 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
             this.display();
           })
       );
+  }
 
+  private renderGeneralSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl).setName(l("通用", "General")).setHeading();
 
     new Setting(containerEl)
@@ -111,7 +135,13 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
           "Command: AI Autocomplete: Trigger inline suggestion. Configure the shortcut in Obsidian Settings → Hotkeys."
         )
       );
+  }
 
+  private renderProviderSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl).setName("Provider").setHeading();
 
     const providers = getProviderOptions();
@@ -127,7 +157,9 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
         )
       )
       .addDropdown((dropdown) => {
-        for (const provider of providers) dropdown.addOption(provider.id, provider.name);
+        for (const provider of providers) {
+          dropdown.addOption(provider.id, provider.name);
+        }
         dropdown.setValue(settings.providerId).onChange(async (value) => {
           settings.providerId = value;
           ensureModels(settings);
@@ -157,76 +189,111 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
       });
 
     if (settings.providerId === "custom") {
-      new Setting(containerEl)
-        .setName("API Base URL")
-        .setDesc(
-          l(
-            "例如 http://127.0.0.1:18180/v1。",
-            "For example http://127.0.0.1:18180/v1."
-          )
-        )
-        .addText((text) =>
-          text
-            .setPlaceholder(DEFAULT_API_BASE_URL)
-            .setValue(settings.baseUrl)
-            .onChange(async (value) => {
-              settings.baseUrl = value.trim();
-              await this.host.saveSettings();
-            })
-        );
-
-      addTextModelSetting(
-        containerEl,
-        l("补全模型", "Completion model"),
-        getProviderModel(settings),
-        async (value) => {
-          setProviderModel(settings, value);
-          await this.host.saveSettings();
-        }
-      );
-      addTextModelSetting(
-        containerEl,
-        l("讨论模型", "Discussion model"),
-        getDiscussionProviderModel(settings),
-        async (value) => {
-          setDiscussionProviderModel(settings, value);
-          await this.host.saveSettings();
-          this.host.onSettingsChanged?.();
-        }
-      );
-    } else {
-      const models = getProviderModels(settings.providerId);
-      addCatalogModelSetting(
-        containerEl,
-        l("补全模型", "Completion model"),
-        models,
-        getProviderModel(settings),
-        async (value) => {
-          setProviderModel(settings, value);
-          await this.host.saveSettings();
-        }
-      );
-      addCatalogModelSetting(
-        containerEl,
-        l("讨论模型", "Discussion model"),
-        models,
-        getDiscussionProviderModel(settings),
-        async (value) => {
-          setDiscussionProviderModel(settings, value);
-          await this.host.saveSettings();
-          this.host.onSettingsChanged?.();
-        }
-      );
+      this.renderCustomProviderModels(containerEl, settings, l);
+      return;
     }
 
+    this.renderCatalogProviderModels(containerEl, settings, l);
+  }
+
+  private renderCustomProviderModels(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl)
-      .setName(l("连接测试", "Connection test"))
-      .setDesc(l("使用当前补全模型发送一个小请求。", "Send a small request with the current completion model."))
-      .addButton((button) =>
-        button.setButtonText(l("测试", "Test")).onClick(() => void this.host.testConnection())
+      .setName("API Base URL")
+      .setDesc(
+        l(
+          "例如 http://127.0.0.1:18180/v1。",
+          "For example http://127.0.0.1:18180/v1."
+        )
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_API_BASE_URL)
+          .setValue(settings.baseUrl)
+          .onChange(async (value) => {
+            settings.baseUrl = value.trim();
+            await this.host.saveSettings();
+          })
       );
 
-    new Setting(containerEl).setName(l("行内补全", "Inline completion")).setHeading();
+    addTextModelSetting(
+      containerEl,
+      l("补全模型", "Completion model"),
+      getProviderModel(settings),
+      async (value) => {
+        setProviderModel(settings, value);
+        await this.host.saveSettings();
+      }
+    );
+
+    addTextModelSetting(
+      containerEl,
+      l("讨论模型", "Discussion model"),
+      getDiscussionProviderModel(settings),
+      async (value) => {
+        setDiscussionProviderModel(settings, value);
+        await this.host.saveSettings();
+        this.host.onSettingsChanged?.();
+      }
+    );
+  }
+
+  private renderCatalogProviderModels(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
+    const models = getProviderModels(settings.providerId);
+
+    addCatalogModelSetting(
+      containerEl,
+      l("补全模型", "Completion model"),
+      models,
+      getProviderModel(settings),
+      async (value) => {
+        setProviderModel(settings, value);
+        await this.host.saveSettings();
+      }
+    );
+
+    addCatalogModelSetting(
+      containerEl,
+      l("讨论模型", "Discussion model"),
+      models,
+      getDiscussionProviderModel(settings),
+      async (value) => {
+        setDiscussionProviderModel(settings, value);
+        await this.host.saveSettings();
+        this.host.onSettingsChanged?.();
+      }
+    );
+  }
+
+  private renderCompletionSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
+    new Setting(containerEl)
+      .setName(l("连接测试", "Connection test"))
+      .setDesc(
+        l(
+          "使用当前补全模型发送一个小请求。",
+          "Send a small request with the current completion model."
+        )
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(l("测试", "Test"))
+          .onClick(() => void this.host.testConnection())
+      );
+
+    new Setting(containerEl)
+      .setName(l("行内补全", "Inline completion"))
+      .setHeading();
 
     addReasoningSetting(
       containerEl,
@@ -266,7 +333,13 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
             await this.host.saveSettings();
           })
       );
+  }
 
+  private renderPromptTemplatesSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl)
       .setName(l("补全提示词模板", "Completion prompt templates"))
       .setHeading();
@@ -286,6 +359,55 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
         });
       });
 
+    this.renderTemplateActions(containerEl, settings, activeTemplate, l);
+
+    new Setting(containerEl)
+      .setName(l("模板名称", "Template name"))
+      .addText((text) =>
+        text.setValue(activeTemplate.name).onChange(async (value) => {
+          const trimmed = value.trim();
+          if (!trimmed) return;
+          activeTemplate.name = trimmed;
+          await this.host.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(l("System Prompt", "System prompt"))
+      .setDesc(
+        l(
+          "当前内置默认提示词以中文维护。",
+          "The built-in default prompt is currently maintained in Chinese."
+        )
+      )
+      .addTextArea((text) => {
+        text.inputEl.rows = 14;
+        text.inputEl.cols = 60;
+        text.setValue(activeTemplate.prompt).onChange(async (value) => {
+          activeTemplate.prompt = value;
+          await this.host.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName(l("重置当前模板", "Reset current template"))
+      .addButton((button) =>
+        button
+          .setButtonText(l("恢复默认", "Reset prompt"))
+          .onClick(async () => {
+            activeTemplate.prompt = DEFAULT_SYSTEM_PROMPT;
+            await this.host.saveSettings();
+            this.display();
+          })
+      );
+  }
+
+  private renderTemplateActions(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    activeTemplate: PromptTemplate,
+    l: Translator
+  ): void {
     new Setting(containerEl)
       .setName(l("模板操作", "Template actions"))
       .addButton((button) =>
@@ -326,6 +448,7 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
           .setDisabled(settings.promptTemplates.length <= 1)
           .onClick(async () => {
             if (settings.promptTemplates.length <= 1) return;
+
             settings.promptTemplates = settings.promptTemplates.filter(
               (template) => template.id !== activeTemplate.id
             );
@@ -334,41 +457,16 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
             this.display();
           })
       );
+  }
 
+  private renderDiscussionSection(
+    containerEl: HTMLElement,
+    settings: AIAutocompleteSettings,
+    l: Translator
+  ): void {
     new Setting(containerEl)
-      .setName(l("模板名称", "Template name"))
-      .addText((text) =>
-        text.setValue(activeTemplate.name).onChange(async (value) => {
-          const trimmed = value.trim();
-          if (!trimmed) return;
-          activeTemplate.name = trimmed;
-          await this.host.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName(l("System Prompt", "System prompt"))
-      .setDesc(l("当前内置默认提示词以中文维护。", "The built-in default prompt is currently maintained in Chinese."))
-      .addTextArea((text) => {
-        text.inputEl.rows = 14;
-        text.inputEl.cols = 60;
-        text.setValue(activeTemplate.prompt).onChange(async (value) => {
-          activeTemplate.prompt = value;
-          await this.host.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName(l("重置当前模板", "Reset current template"))
-      .addButton((button) =>
-        button.setButtonText(l("恢复默认", "Reset prompt")).onClick(async () => {
-          activeTemplate.prompt = DEFAULT_SYSTEM_PROMPT;
-          await this.host.saveSettings();
-          this.display();
-        })
-      );
-
-    new Setting(containerEl).setName(l("讨论侧栏", "Discussion sidebar")).setHeading();
+      .setName(l("讨论侧栏", "Discussion sidebar"))
+      .setHeading();
 
     addReasoningSetting(
       containerEl,
@@ -399,7 +497,12 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName(l("讨论 System Prompt", "Discussion system prompt"))
-      .setDesc(l("目前内置默认提示词先以中文维护。", "The built-in discussion prompt is currently maintained in Chinese."))
+      .setDesc(
+        l(
+          "目前内置默认提示词先以中文维护。",
+          "The built-in discussion prompt is currently maintained in Chinese."
+        )
+      )
       .addTextArea((text) => {
         text.inputEl.rows = 12;
         text.inputEl.cols = 60;
@@ -412,13 +515,21 @@ export class AIAutocompleteSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName(l("重置讨论提示词", "Reset discussion prompt"))
       .addButton((button) =>
-        button.setButtonText(l("恢复默认", "Reset prompt")).onClick(async () => {
-          settings.discussionPrompt = DEFAULT_DISCUSSION_PROMPT;
-          await this.host.saveSettings();
-          this.display();
-        })
+        button
+          .setButtonText(l("恢复默认", "Reset prompt"))
+          .onClick(async () => {
+            settings.discussionPrompt = DEFAULT_DISCUSSION_PROMPT;
+            await this.host.saveSettings();
+            this.display();
+          })
       );
   }
+}
+
+function createTranslator(language: UiLanguage): Translator {
+  return function translate(zh: string, en: string): string {
+    return tr(language, zh, en);
+  };
 }
 
 function addReasoningSetting(
@@ -428,7 +539,8 @@ function addReasoningSetting(
   value: ReasoningEffort,
   onChange: (value: ReasoningEffort) => Promise<void>
 ): void {
-  const l = (zh: string, en: string) => tr(settings.uiLanguage, zh, en);
+  const l = createTranslator(settings.uiLanguage);
+
   new Setting(containerEl)
     .setName(name)
     .setDesc(reasoningDescription(settings, value))
@@ -450,19 +562,22 @@ function reasoningDescription(
   settings: AIAutocompleteSettings,
   value: ReasoningEffort
 ): string {
-  const l = (zh: string, en: string) => tr(settings.uiLanguage, zh, en);
+  const l = createTranslator(settings.uiLanguage);
+
   if (!value) {
     return l(
       "不向 pi-ai 传 reasoning 字段，由 Provider/模型使用自己的默认行为。",
       "No reasoning level is passed to pi-ai; the provider/model uses its default behavior."
     );
   }
+
   if (settings.providerId === "custom" && value === "minimal") {
     return l(
       "向 pi-ai 传 reasoning=minimal；当前 Custom OpenAI-compatible 映射为 reasoning_effort=none。",
       "Sends reasoning=minimal to pi-ai; the current Custom OpenAI-compatible mapping emits reasoning_effort=none."
     );
   }
+
   return l(
     `向 pi-ai 传 reasoning=${value}；具体 HTTP 字段由 ${settings.providerId} adapter 映射。`,
     `Sends reasoning=${value} to pi-ai; the ${settings.providerId} adapter maps it to the provider-specific HTTP field.`
@@ -481,15 +596,17 @@ function addTokenBudgetSetting(
     .setDesc(description)
     .addText((text) => {
       text.inputEl.type = "number";
-      text.inputEl.min = "16";
-      text.inputEl.max = "65536";
+      text.inputEl.min = String(MIN_TOKEN_BUDGET);
+      text.inputEl.max = String(MAX_TOKEN_BUDGET);
       text.inputEl.step = "16";
       text.setValue(String(value)).onChange(async (raw) => {
         if (!raw.trim()) return;
         await onChange(normalizeTokenBudget(raw, value));
       });
-      text.inputEl.addEventListener("blur", () => {
-        text.inputEl.value = String(normalizeTokenBudget(text.inputEl.value, value));
+      text.inputEl.addEventListener("blur", function normalizeBudgetOnBlur(): void {
+        text.inputEl.value = String(
+          normalizeTokenBudget(text.inputEl.value, value)
+        );
       });
     });
 }
@@ -519,15 +636,19 @@ function addCatalogModelSetting(
     if (value && !models.some((model) => model.id === value)) {
       dropdown.addOption(value, `${value} *`);
     }
-    for (const model of models) dropdown.addOption(model.id, model.name);
+    for (const model of models) {
+      dropdown.addOption(model.id, model.name);
+    }
     dropdown.setValue(value).onChange(onChange);
   });
 }
 
 function ensureModels(settings: AIAutocompleteSettings): void {
   if (settings.providerId === "custom") return;
+
   const models = getProviderModels(settings.providerId);
   if (models.length === 0) return;
+
   if (!models.some((model) => model.id === getProviderModel(settings))) {
     setProviderModel(settings, models[0].id);
   }
