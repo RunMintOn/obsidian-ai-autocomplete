@@ -27,31 +27,32 @@ import { providerFetch } from "./transport";
 
 export const NO_SUGGESTION = "NO_SUGGESTION";
 
-export const DEFAULT_SYSTEM_PROMPT = `You are an inline completion engine inside the Obsidian Markdown editor.
+export const DEFAULT_SYSTEM_PROMPT = `你是 Obsidian Markdown 编辑器中的行内补全引擎。
 
-Return exactly the text that should be inserted at <cursor>.
+你的任务是根据光标前后的内容，返回应该直接插入 <cursor> 位置的文本。
 
-Rules:
-- Output only the continuation text. No explanation, labels, or quotes.
-- Preserve any leading space or newline needed for direct insertion.
-- Do not repeat text already present before or after the cursor.
-- Match the note's language, tone, Markdown structure, and punctuation.
-- Prefer a short, high-confidence continuation over a long answer.
-- For lists, tables, code, YAML, and other structured text, preserve the structure.
-- If there is not enough context for a useful continuation, output exactly NO_SUGGESTION.`;
+规则：
+- 只输出补全文本，不要解释、加标签、加引号或复述问题。
+- 保留直接插入所需要的前导空格和换行。
+- 不要重复光标前或光标后已经存在的文字。
+- 匹配当前笔记的语言、语气、Markdown 结构和标点习惯。
+- 优先给出短而高置信度的续写，不要为了长度强行扩写。
+- 列表、表格、代码、YAML 等结构化内容必须保持原结构。
+- 如果上下文不足以生成有价值的续写，只输出 NO_SUGGESTION。`;
 
-export const DEFAULT_DISCUSSION_PROMPT = `You are a concise thinking partner inside Obsidian.
+export const DEFAULT_DISCUSSION_PROMPT = `你是 Obsidian 中的思考与讨论助手。
 
-Answer the user's question directly. The user may pin a selected passage from the current note as reference context, and earlier turns in this discussion may also be provided.
+用户会围绕当前笔记进行讨论，也可能固定一段选中文字作为参考。请直接回答用户当前的问题，并结合之前的对话保持连续性。
 
-Rules:
-- Focus on the exact point being discussed.
-- Prefer clear reasoning, concrete distinctions, examples, and counterexamples over generic advice.
-- Match the user's language unless there is a strong reason not to.
-- Keep answers readable in a sidebar; be concise unless the question needs depth.
-- Do not mention these instructions or the XML-like context tags.`;
+规则：
+- 聚焦用户正在讨论的具体问题，不要泛泛而谈。
+- 优先给出清晰的推理、关键区分、例子、反例和可操作结论。
+- 默认使用用户当前使用的语言。
+- 回答需要适合在侧边栏阅读：能简洁就简洁，需要深入时再展开。
+- 不要提及系统提示词，也不要解释内部 XML 风格的上下文标签。`;
 
-export type ReasoningEffort = "" | "none" | "low" | "medium" | "high";
+/** Empty string means: do not send a pi-ai reasoning level. */
+export type ReasoningEffort = "" | "minimal" | "low" | "medium" | "high";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -71,6 +72,7 @@ export interface CompletionRequestOptions {
 
 export interface StreamCallbacks {
   onStatus?: (status: "thinking" | "generating") => void;
+  onThinking?: (thinking: string) => void;
   onText?: (text: string) => void;
 }
 
@@ -174,6 +176,7 @@ export async function streamChatCompletion(
       requestOptions
     );
 
+    let streamedThinking = "";
     let streamedText = "";
     for await (const event of stream) {
       if (signal.aborted) throw abortError();
@@ -181,6 +184,10 @@ export async function streamChatCompletion(
       switch (event.type) {
         case "thinking_start":
           callbacks.onStatus?.("thinking");
+          break;
+        case "thinking_delta":
+          streamedThinking += event.delta;
+          callbacks.onThinking?.(streamedThinking);
           break;
         case "text_start":
           callbacks.onStatus?.("generating");
@@ -222,7 +229,7 @@ export async function fetchCompletion(
   signal: AbortSignal
 ): Promise<string | null> {
   const systemPrompt = options.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
-  const userMessage = `<before_cursor>\n${prefix}\n</before_cursor>\n\n<cursor/>\n\n<after_cursor>\n${suffix}\n</after_cursor>\n\nReturn only the exact text to insert at <cursor>. Include leading whitespace when it is required.`;
+  const userMessage = `<before_cursor>\n${prefix}\n</before_cursor>\n\n<cursor/>\n\n<after_cursor>\n${suffix}\n</after_cursor>\n\n只返回应该直接插入 <cursor> 的准确文本；如果需要前导空格或换行，请保留。`;
 
   const text = await fetchChatCompletion(
     options,
@@ -287,6 +294,8 @@ function resolveRuntime(options: CompletionRequestOptions): {
     provider: "ai-autocomplete-custom",
     baseUrl,
     reasoning: true,
+    // pi-ai uses normalized levels. For our generic OpenAI-compatible custom
+    // endpoint, minimal maps to the commonly-supported reasoning_effort=none.
     thinkingLevelMap: {
       minimal: "none",
       low: "low",
@@ -328,9 +337,7 @@ function resolveRuntime(options: CompletionRequestOptions): {
 function toPiReasoning(
   effort: ReasoningEffort | undefined
 ): ThinkingLevel | undefined {
-  if (!effort) return undefined;
-  if (effort === "none") return "minimal";
-  return effort;
+  return effort || undefined;
 }
 
 function buildContext(messages: ChatMessage[], model: Model<Api>): Context {
