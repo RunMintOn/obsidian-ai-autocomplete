@@ -88,7 +88,10 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
       : "custom");
 
   const providerApiKeys = normalizeStringMap(loaded.providerApiKeys);
-  const providerModels = normalizeStringMap(loaded.providerModels);
+  const providerModels = {
+    ...DEFAULT_SETTINGS.providerModels,
+    ...normalizeStringMap(loaded.providerModels),
+  };
 
   if (loaded.apiKey?.trim() && !providerApiKeys[providerId]) {
     providerApiKeys[providerId] = loaded.apiKey.trim();
@@ -98,14 +101,16 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
   }
 
   return {
-    ...DEFAULT_SETTINGS,
-    ...loaded,
-    autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? true,
-    eagerness: normalizeEagerness(loaded.eagerness ?? 3),
+    autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? DEFAULT_SETTINGS.autoEnabled,
+    eagerness: normalizeEagerness(loaded.eagerness ?? DEFAULT_SETTINGS.eagerness),
     providerId,
     providerApiKeys,
     providerModels,
     baseUrl,
+    temperature:
+      typeof loaded.temperature === "number"
+        ? loaded.temperature
+        : DEFAULT_SETTINGS.temperature,
     maxTokens: normalizeTokenBudget(loaded.maxTokens, DEFAULT_SETTINGS.maxTokens),
     discussionMaxTokens: normalizeTokenBudget(
       loaded.discussionMaxTokens,
@@ -117,6 +122,14 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
     discussionReasoningEffort: normalizeReasoningEffort(
       loaded.discussionReasoningEffort
     ),
+    maxPrefixChars:
+      typeof loaded.maxPrefixChars === "number"
+        ? loaded.maxPrefixChars
+        : DEFAULT_SETTINGS.maxPrefixChars,
+    maxSuffixChars:
+      typeof loaded.maxSuffixChars === "number"
+        ? loaded.maxSuffixChars
+        : DEFAULT_SETTINGS.maxSuffixChars,
     promptTemplates,
     activePromptTemplateId,
     discussionPrompt:
