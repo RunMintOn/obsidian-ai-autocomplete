@@ -1,48 +1,61 @@
 # AI Autocomplete
 
-AI inline writing completion for Obsidian, powered by OpenAI-compatible APIs. The default setup routes through [OpenRouter](https://openrouter.ai) to the Groq provider for fast inference.
+A lightweight inline AI completion plugin for Obsidian. It renders Copilot-style ghost text directly at the cursor and works with any OpenAI-compatible Chat Completions API.
 
-Type naturally and get ghost text suggestions that appear inline. Press **Tab** to accept, **Esc** to dismiss.
+## What it feels like
 
-## Features
+Pause briefly while typing and a muted suggestion appears inline.
 
-- **Ghost text completion** — transparent suggestions appear at your cursor, like GitHub Copilot
-- **Context-aware** — reads text before and after cursor for coherent continuations
-- **Insight-oriented** — can surface sharper questions, hidden assumptions, analogies, and reframes for personal knowledge notes
-- **Fast** — defaults to OpenRouter's Groq provider with throughput-prioritized routing
-- **Bilingual** — automatically detects and continues in Chinese or English
-- **Lightweight** — 6KB plugin, no dependencies
+- **Tab** accepts the whole suggestion.
+- **Esc** dismisses it.
+- **Cmd/Ctrl + Right Arrow** accepts the next word/segment.
+- If you keep typing text that matches the suggestion, the matching prefix is consumed and only the remaining ghost text stays visible.
+- Chinese/Japanese/Korean IME composition is handled separately so the ghost does not fight the operating system's composition range.
 
-## Usage
+## Provider setup
 
-1. Install the plugin
-2. Go to Settings → AI Autocomplete → enter your OpenRouter API key
-3. Start writing — suggestions appear after a brief pause
+The plugin intentionally has one provider contract: OpenAI-compatible `POST /chat/completions`.
 
-| Key | Action |
-|-----|--------|
-| Tab | Accept suggestion |
-| Esc | Dismiss suggestion |
-| Keep typing | Suggestion auto-dismisses |
+Configure:
 
-## Settings
+- **API base URL** — for example `https://api.openai.com/v1`, `http://localhost:1234/v1`, or another compatible gateway. If the URL does not already end in `/chat/completions`, the plugin appends it.
+- **API key** — optional for local endpoints that do not require authentication.
+- **Model** — the exact model name accepted by the endpoint.
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| API base URL | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible chat completions endpoint |
-| Model | `openai/gpt-oss-120b:nitro` | Smart default via OpenRouter's Groq provider |
-| System prompt | Built-in heuristic prompt | Editable prompt that controls ghost text style and insight behavior |
-| Reasoning effort | `minimal` | Keeps reasoning models fast enough for inline autocomplete |
-| Hide reasoning | On | Excludes reasoning tokens from suggestion text |
-| Provider | `groq` | Forces OpenRouter's Groq provider |
-| Provider sort | `throughput` | Prioritizes high token throughput |
-| Allow fallbacks | Off | Keeps requests on the selected provider |
-| Trigger delay | 800ms | How long to wait after typing before fetching a suggestion |
-| Enabled | On | Toggle via settings or command palette |
+This keeps the plugin compatible with OpenAI, OpenRouter, Groq-compatible gateways, LM Studio, vLLM, and other servers that expose the standard Chat Completions shape.
 
-## How it works
+## Completion behavior
 
-The plugin uses CodeMirror 6 extensions to render transparent "ghost text" at the cursor position. When you pause typing, it sends the surrounding context (up to 2000 chars before + 500 chars after cursor) to the configured API and displays the completion as inline ghost text.
+The plugin sends a fill-in-the-middle style prompt containing text before and after the cursor. The provider itself does not need a native FIM API.
+
+Default context window sent per request:
+
+- up to 2400 characters before the cursor
+- up to 600 characters after the cursor
+
+The request is triggered after a configurable idle delay (650 ms by default). Results are only displayed when the document and cursor are still at the position that initiated the request, so stale completions cannot overwrite newer typing.
+
+Normal model output is not trimmed before insertion. Leading spaces and newlines are preserved because they may be required for correct inline completion.
+
+## Commands
+
+The command palette exposes:
+
+- Trigger inline suggestion
+- Accept inline suggestion
+- Accept next suggestion segment
+- Dismiss inline suggestion
+- Toggle auto-completion
+- Test provider connection
+
+## Development
+
+```bash
+npm ci
+npm run build
+```
+
+`npm run build` runs TypeScript typechecking before producing the production bundle. GitHub Actions runs the same build on the development branch and pull requests.
 
 ## License
 
