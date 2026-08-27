@@ -1,5 +1,6 @@
-import type { UiLanguage } from "./settings";
+import type { UiLanguage } from "./settings.js";
 
 export function tr(language: UiLanguage, zh: string, en: string): string {
-  return language === "en" ? en : zh;
+  if (language === "en") return en;
+  return zh;
 }
