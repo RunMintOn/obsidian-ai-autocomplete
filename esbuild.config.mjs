@@ -9,6 +9,8 @@ esbuild.build({
   external: [
     "obsidian",
     "electron",
+    "node:http",
+    "node:https",
     "@codemirror/autocomplete",
     "@codemirror/collab",
     "@codemirror/commands",
