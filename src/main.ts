@@ -1,19 +1,34 @@
 import {
   App,
   Editor,
+  MarkdownView,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
+  WorkspaceLeaf,
 } from "obsidian";
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import {
-  acceptDiscussionAnswer,
-  discussionExtension,
-  dismissDiscussionAnswer,
-  showDiscussionAnswer,
-} from "./discussion";
+  type ChatMessage,
+  CompletionError,
+  DEFAULT_DISCUSSION_PROMPT,
+  DEFAULT_SYSTEM_PROMPT,
+  fetchCompletion,
+  getProviderModels,
+  getProviderOptions,
+  type CompletionRequestOptions,
+  type ReasoningEffort,
+  streamChatCompletion,
+} from "./ai-client";
+import {
+  DiscussionSidebarView,
+  type DiscussionRunStatus,
+  type DiscussionSidebarHost,
+  type DiscussionSnapshot,
+  VIEW_TYPE_AI_DISCUSSION,
+} from "./discussion-sidebar";
 import {
   acceptSuggestion,
   acceptSuggestionSegment,
@@ -24,22 +39,22 @@ import {
   type InlineSuggestionConfig,
 } from "./ghost-text";
 import {
-  type ChatMessage,
-  CompletionError,
-  type CompletionRequestOptions,
+  type AIAutocompleteSettings,
+  createTemplateId,
   DEFAULT_API_BASE_URL,
-  DEFAULT_DISCUSSION_PROMPT,
-  DEFAULT_SYSTEM_PROMPT,
-  fetchChatCompletion,
-  fetchCompletion,
-  type ReasoningEffort,
-} from "./openai-client";
-
-interface PromptTemplate {
-  id: string;
-  name: string;
-  prompt: string;
-}
+  DEFAULT_SETTINGS,
+  getActivePromptTemplate,
+  getProviderApiKey,
+  getProviderModel,
+  normalizeEagerness,
+  normalizeLoadedSettings,
+  normalizeReasoningEffort,
+  normalizeTokenBudget,
+  setProviderApiKey,
+  setProviderModel,
+  type PromptTemplate,
+  uniqueTemplateName,
+} from "./settings";
 
 interface DiscussionTurn {
   role: "user" | "assistant";
@@ -47,103 +62,93 @@ interface DiscussionTurn {
 }
 
 interface DiscussionSession {
+  reference: string;
   turns: DiscussionTurn[];
+  status: DiscussionRunStatus;
+  streamingText: string;
+  error: string;
 }
 
-interface AIAutocompleteSettings {
-  autoEnabled: boolean;
-  eagerness: number;
-  apiKey: string;
-  model: string;
-  baseUrl: string;
-  temperature: number;
-  maxTokens: number;
-  discussionMaxTokens: number;
-  completionReasoningEffort: ReasoningEffort;
-  discussionReasoningEffort: ReasoningEffort;
-  maxPrefixChars: number;
-  maxSuffixChars: number;
-  promptTemplates: PromptTemplate[];
-  activePromptTemplateId: string;
-  discussionPrompt: string;
-}
+const MAX_DISCUSSION_TURNS = 12;
 
-type LegacySettings = Partial<AIAutocompleteSettings> & {
-  enabled?: boolean;
-  systemPrompt?: string;
-  delay?: number;
-  minPrefixChars?: number;
-};
-
-const DEFAULT_TEMPLATE_ID = "default";
-const MAX_DISCUSSION_TURNS = 8;
-const DISCUSSION_CONTEXT_BEFORE = 1800;
-const DISCUSSION_CONTEXT_AFTER = 900;
-
-const DEFAULT_SETTINGS: AIAutocompleteSettings = {
-  autoEnabled: true,
-  eagerness: 3,
-  apiKey: "",
-  model: "gpt-4o-mini",
-  baseUrl: DEFAULT_API_BASE_URL,
-  temperature: 0.2,
-  maxTokens: 96,
-  discussionMaxTokens: 384,
-  completionReasoningEffort: "",
-  discussionReasoningEffort: "",
-  maxPrefixChars: 2400,
-  maxSuffixChars: 600,
-  promptTemplates: [
-    {
-      id: DEFAULT_TEMPLATE_ID,
-      name: "Default",
-      prompt: DEFAULT_SYSTEM_PROMPT,
-    },
-  ],
-  activePromptTemplateId: DEFAULT_TEMPLATE_ID,
-  discussionPrompt: DEFAULT_DISCUSSION_PROMPT,
-};
-
-export default class AIAutocompletePlugin extends Plugin {
+export default class AIAutocompletePlugin
+  extends Plugin
+  implements DiscussionSidebarHost
+{
   settings: AIAutocompleteSettings = DEFAULT_SETTINGS;
   private editorExtensions: Extension[] = [];
   private lastErrorNoticeAt = 0;
   private readonly discussionSessions = new Map<string, DiscussionSession>();
   private discussionController: AbortController | null = null;
+  private discussionRequestNoteKey: string | null = null;
+  private discussionNoteKey: string | null = null;
+  private lastMarkdownView: MarkdownView | null = null;
+  private sidebarRefreshQueued = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    this.editorExtensions = [
-      ...inlineSuggestionExtension(
-        async ({ prefix, suffix, signal }) => {
-          try {
-            return await fetchCompletion(
-              this.getCompletionOptions(),
-              prefix,
-              suffix,
-              signal
-            );
-          } catch (error) {
-            if (error instanceof Error && error.name === "AbortError") return null;
-            this.showCompletionError(error);
-            return null;
-          }
-        },
-        () => this.getInlineConfig()
-      ),
-      ...discussionExtension,
-    ];
+    this.editorExtensions = inlineSuggestionExtension(
+      async ({ prefix, suffix, signal }) => {
+        try {
+          return await fetchCompletion(
+            this.getCompletionOptions(),
+            prefix,
+            suffix,
+            signal
+          );
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") return null;
+          this.showCompletionError(error);
+          return null;
+        }
+      },
+      () => this.getInlineConfig()
+    );
 
     this.registerEditorExtension(this.editorExtensions);
+    this.registerView(
+      VIEW_TYPE_AI_DISCUSSION,
+      (leaf) => new DiscussionSidebarView(leaf, this)
+    );
     this.addSettingTab(new AIAutocompleteSettingTab(this.app, this));
     this.registerCommands();
+
+    this.addRibbonIcon("messages-square", "Open AI Discussion", () => {
+      void this.activateDiscussionSidebar(true);
+    });
+
+    this.lastMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (this.lastMarkdownView?.file?.path) {
+      this.discussionNoteKey = this.lastMarkdownView.file.path;
+    }
+
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf?.view instanceof MarkdownView) {
+          this.lastMarkdownView = leaf.view;
+          if (leaf.view.file?.path) {
+            this.discussionNoteKey = leaf.view.file.path;
+          }
+          this.refreshSidebar();
+        }
+      })
+    );
+
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (file?.path) this.discussionNoteKey = file.path;
+        this.refreshSidebar();
+      })
+    );
   }
 
   onunload(): void {
     this.discussionController?.abort();
     this.discussionController = null;
+    this.discussionRequestNoteKey = null;
     this.discussionSessions.clear();
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE_AI_DISCUSSION);
   }
 
   private registerCommands(): void {
@@ -175,27 +180,40 @@ export default class AIAutocompletePlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "open-discussion",
+      name: "Open AI discussion sidebar",
+      callback: () => void this.activateDiscussionSidebar(true),
+    });
+
+    // Keep the historical command id so existing hotkey assignments survive,
+    // but change the behavior: pin the selection and open the sidebar. It does
+    // not automatically send the selection as a question.
+    this.addCommand({
       id: "ask-selection",
-      name: "Ask / continue discussion about selection",
-      editorCallback: (editor) => void this.askSelection(editor),
+      name: "Discuss selection in sidebar",
+      editorCallback: (editor, context) => {
+        const selection = editor.getSelection().trim();
+        if (!selection) {
+          new Notice("AI autocomplete: select a passage first");
+          return;
+        }
+
+        if (context instanceof MarkdownView) this.lastMarkdownView = context;
+        const path = context.file?.path ?? this.app.workspace.getActiveFile()?.path;
+        if (!path) {
+          new Notice("AI autocomplete: cannot determine the note for this selection");
+          return;
+        }
+
+        this.pinDiscussionReference(path, selection);
+        void this.activateDiscussionSidebar(true);
+      },
     });
 
     this.addCommand({
       id: "new-discussion",
       name: "Start new discussion for current note",
-      editorCallback: (editor) => this.newDiscussion(editor),
-    });
-
-    this.addCommand({
-      id: "accept-discussion",
-      name: "Accept discussion answer",
-      editorCallback: (editor) => withView(editor, acceptDiscussionAnswer),
-    });
-
-    this.addCommand({
-      id: "dismiss-discussion",
-      name: "Dismiss discussion answer",
-      editorCallback: (editor) => withView(editor, dismissDiscussionAnswer),
+      callback: () => this.newDiscussion(),
     });
 
     this.addCommand({
@@ -221,36 +239,7 @@ export default class AIAutocompletePlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const loaded = ((await this.loadData()) ?? {}) as LegacySettings;
-
-    const legacyPrompt = loaded.systemPrompt?.trim();
-    const promptTemplates = normalizeTemplates(
-      loaded.promptTemplates,
-      legacyPrompt || DEFAULT_SYSTEM_PROMPT
-    );
-
-    const activePromptTemplateId = promptTemplates.some(
-      (template) => template.id === loaded.activePromptTemplateId
-    )
-      ? (loaded.activePromptTemplateId as string)
-      : promptTemplates[0].id;
-
-    this.settings = {
-      ...DEFAULT_SETTINGS,
-      ...loaded,
-      autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? true,
-      eagerness: normalizeEagerness(loaded.eagerness ?? 3),
-      completionReasoningEffort: normalizeReasoningEffort(
-        loaded.completionReasoningEffort
-      ),
-      discussionReasoningEffort: normalizeReasoningEffort(
-        loaded.discussionReasoningEffort
-      ),
-      promptTemplates,
-      activePromptTemplateId,
-      discussionPrompt:
-        loaded.discussionPrompt?.trim() || DEFAULT_DISCUSSION_PROMPT,
-    };
+    this.settings = normalizeLoadedSettings(await this.loadData());
   }
 
   async saveSettings(): Promise<void> {
@@ -267,17 +256,14 @@ export default class AIAutocompletePlugin extends Plugin {
   }
 
   getActivePromptTemplate(): PromptTemplate {
-    return (
-      this.settings.promptTemplates.find(
-        (template) => template.id === this.settings.activePromptTemplateId
-      ) ?? this.settings.promptTemplates[0]
-    );
+    return getActivePromptTemplate(this.settings);
   }
 
   getCompletionOptions(): CompletionRequestOptions {
     return {
-      apiKey: this.settings.apiKey,
-      model: this.settings.model,
+      providerId: this.settings.providerId,
+      apiKey: getProviderApiKey(this.settings),
+      model: getProviderModel(this.settings),
       baseUrl: this.settings.baseUrl,
       systemPrompt: this.getActivePromptTemplate().prompt,
       temperature: this.settings.temperature,
@@ -288,8 +274,9 @@ export default class AIAutocompletePlugin extends Plugin {
 
   getDiscussionOptions(): CompletionRequestOptions {
     return {
-      apiKey: this.settings.apiKey,
-      model: this.settings.model,
+      providerId: this.settings.providerId,
+      apiKey: getProviderApiKey(this.settings),
+      model: getProviderModel(this.settings),
       baseUrl: this.settings.baseUrl,
       temperature: this.settings.temperature,
       maxTokens: this.settings.discussionMaxTokens,
@@ -297,96 +284,258 @@ export default class AIAutocompletePlugin extends Plugin {
     };
   }
 
-  private async askSelection(editor: Editor): Promise<void> {
-    const view = cmOf(editor);
-    if (!view) return;
-
-    const selection = view.state.selection.main;
-    if (selection.empty) {
-      new Notice("AI autocomplete: select a question or passage first");
-      return;
-    }
-
-    const question = view.state.doc
-      .sliceString(selection.from, selection.to)
-      .trim();
-    if (!question) return;
-
-    clearAllSuggestions();
-    dismissDiscussionAnswer(view);
-
-    const noteKey = this.currentNoteKey();
+  getDiscussionSnapshot(): DiscussionSnapshot {
+    const noteKey = this.currentDiscussionNoteKey();
     const session = this.getDiscussionSession(noteKey);
-    const doc = view.state.doc;
-    const lineEnd = doc.lineAt(selection.to).to;
-    const context = doc.sliceString(
-      Math.max(0, selection.from - DISCUSSION_CONTEXT_BEFORE),
-      Math.min(doc.length, selection.to + DISCUSSION_CONTEXT_AFTER)
-    );
+    return {
+      notePath: noteKey === "__active-editor__" ? null : noteKey,
+      reference: session.reference,
+      turns: session.turns,
+      status: session.status,
+      streamingText: session.streamingText,
+      error: session.error,
+    };
+  }
 
-    this.discussionController?.abort();
-    const controller = new AbortController();
-    this.discussionController = controller;
+  async sendDiscussion(question: string): Promise<void> {
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion) return;
+
+    const noteKey = this.currentDiscussionNoteKey();
+    const session = this.getDiscussionSession(noteKey);
+
+    this.abortDiscussionRequest();
+
+    const previousTurns = session.turns.slice();
+    const reference = session.reference;
+    session.turns.push({ role: "user", content: trimmedQuestion });
+    this.trimDiscussionTurns(session);
+    session.status = "thinking";
+    session.streamingText = "";
+    session.error = "";
+    this.refreshSidebar();
 
     const messages: ChatMessage[] = [
       { role: "system", content: this.settings.discussionPrompt },
-      ...session.turns.map((turn) => ({
+      ...previousTurns.map((turn) => ({
         role: turn.role,
         content: turn.content,
       })),
       {
         role: "user",
-        content: `<note_context>\n${context}\n</note_context>\n\n<selected>\n${question}\n</selected>\n\nRespond to the selected question or passage. Use the note context and earlier discussion only when relevant.`,
+        content: reference
+          ? `<reference note="${escapeXmlAttribute(noteKey)}">\n${reference}\n</reference>\n\n<question>\n${trimmedQuestion}\n</question>`
+          : trimmedQuestion,
       },
     ];
 
+    const controller = new AbortController();
+    this.discussionController = controller;
+    this.discussionRequestNoteKey = noteKey;
+
     try {
-      const result = await fetchChatCompletion(
+      const result = await streamChatCompletion(
         this.getDiscussionOptions(),
         messages,
-        controller.signal
+        controller.signal,
+        {
+          onStatus: (status) => {
+            if (!this.isCurrentDiscussionRequest(controller, noteKey)) return;
+            session.status = status;
+            this.queueSidebarRefresh();
+          },
+          onText: (text) => {
+            if (!this.isCurrentDiscussionRequest(controller, noteKey)) return;
+            session.status = "generating";
+            session.streamingText = text;
+            this.queueSidebarRefresh();
+          },
+        }
       );
-      if (controller.signal.aborted || !result?.trim()) return;
 
-      const answer = result.trim();
-      session.turns.push({ role: "user", content: question });
-      session.turns.push({ role: "assistant", content: answer });
-      if (session.turns.length > MAX_DISCUSSION_TURNS) {
-        session.turns.splice(0, session.turns.length - MAX_DISCUSSION_TURNS);
+      if (!this.isCurrentDiscussionRequest(controller, noteKey)) return;
+      const answer = result?.trim();
+      if (!answer) {
+        throw new CompletionError("The model returned no answer text.");
       }
 
-      if (view.state.doc !== doc) return;
-      showDiscussionAnswer(view, lineEnd, answer);
+      session.turns.push({ role: "assistant", content: answer });
+      this.trimDiscussionTurns(session);
+      session.status = "idle";
+      session.streamingText = "";
+      session.error = "";
+      this.refreshSidebar();
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") return;
-      this.showCompletionError(error);
+      if (error instanceof Error && error.name === "AbortError") {
+        if (this.discussionRequestNoteKey === noteKey) {
+          session.status = "idle";
+          session.streamingText = "";
+          this.refreshSidebar();
+        }
+        return;
+      }
+
+      const message =
+        error instanceof CompletionError || error instanceof Error
+          ? error.message
+          : "Unknown completion error";
+      session.status = "error";
+      session.error = message;
+      session.streamingText = "";
+      console.error("AI autocomplete: discussion error", error);
+      this.refreshSidebar();
     } finally {
       if (this.discussionController === controller) {
         this.discussionController = null;
+        this.discussionRequestNoteKey = null;
       }
     }
   }
 
-  private newDiscussion(editor: Editor): void {
-    const view = cmOf(editor);
-    if (view) dismissDiscussionAnswer(view);
-    this.discussionController?.abort();
-    this.discussionController = null;
-    this.discussionSessions.delete(this.currentNoteKey());
-    new Notice("AI autocomplete: started a new discussion");
+  newDiscussion(): void {
+    const noteKey = this.currentDiscussionNoteKey();
+    if (this.discussionRequestNoteKey === noteKey) {
+      this.abortDiscussionRequest();
+    }
+    this.discussionSessions.set(noteKey, createDiscussionSession());
+    this.refreshSidebar();
   }
 
-  private currentNoteKey(): string {
-    return this.app.workspace.getActiveFile()?.path ?? "__active-editor__";
+  clearDiscussionReference(): void {
+    const session = this.getDiscussionSession(this.currentDiscussionNoteKey());
+    session.reference = "";
+    this.refreshSidebar();
+  }
+
+  captureCurrentSelection(): boolean {
+    const view =
+      this.lastMarkdownView ?? this.app.workspace.getActiveViewOfType(MarkdownView);
+    const selection = view?.editor.getSelection().trim() ?? "";
+    const path = view?.file?.path;
+
+    if (!selection || !path) {
+      new Notice("AI autocomplete: select text in a Markdown note first");
+      return false;
+    }
+
+    this.pinDiscussionReference(path, selection);
+    return true;
+  }
+
+  private pinDiscussionReference(notePath: string, selection: string): void {
+    this.discussionNoteKey = notePath;
+    const session = this.getDiscussionSession(notePath);
+    session.reference = selection;
+    session.error = "";
+    this.refreshSidebar();
+  }
+
+  private async activateDiscussionSidebar(focusInput: boolean): Promise<void> {
+    const workspace = this.app.workspace;
+    const workspaceWithSideLeaf = workspace as typeof workspace & {
+      ensureSideLeaf?: (
+        type: string,
+        side: "left" | "right",
+        options?: { active?: boolean; reveal?: boolean }
+      ) => Promise<WorkspaceLeaf>;
+    };
+
+    let leaf: WorkspaceLeaf | null = null;
+    if (typeof workspaceWithSideLeaf.ensureSideLeaf === "function") {
+      leaf = await workspaceWithSideLeaf.ensureSideLeaf(
+        VIEW_TYPE_AI_DISCUSSION,
+        "right",
+        { active: true, reveal: true }
+      );
+    } else {
+      leaf = workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)[0] ?? null;
+      if (!leaf) {
+        leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
+        if (leaf) {
+          await leaf.setViewState({
+            type: VIEW_TYPE_AI_DISCUSSION,
+            active: true,
+          });
+        }
+      }
+      if (leaf) await workspace.revealLeaf(leaf);
+    }
+
+    if (!leaf) {
+      new Notice("AI autocomplete: could not open the discussion sidebar");
+      return;
+    }
+
+    const view = leaf.view;
+    if (view instanceof DiscussionSidebarView) {
+      view.refresh();
+      if (focusInput) requestAnimationFrame(() => view.focusInput());
+    }
+  }
+
+  private refreshSidebar(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)) {
+      if (leaf.view instanceof DiscussionSidebarView) leaf.view.refresh();
+    }
+  }
+
+  private queueSidebarRefresh(): void {
+    if (this.sidebarRefreshQueued) return;
+    this.sidebarRefreshQueued = true;
+    requestAnimationFrame(() => {
+      this.sidebarRefreshQueued = false;
+      this.refreshSidebar();
+    });
+  }
+
+  private currentDiscussionNoteKey(): string {
+    return (
+      this.discussionNoteKey ??
+      this.lastMarkdownView?.file?.path ??
+      this.app.workspace.getActiveFile()?.path ??
+      "__active-editor__"
+    );
   }
 
   private getDiscussionSession(noteKey: string): DiscussionSession {
     let session = this.discussionSessions.get(noteKey);
     if (!session) {
-      session = { turns: [] };
+      session = createDiscussionSession();
       this.discussionSessions.set(noteKey, session);
     }
     return session;
+  }
+
+  private trimDiscussionTurns(session: DiscussionSession): void {
+    if (session.turns.length > MAX_DISCUSSION_TURNS) {
+      session.turns.splice(0, session.turns.length - MAX_DISCUSSION_TURNS);
+    }
+  }
+
+  private abortDiscussionRequest(): void {
+    const previousKey = this.discussionRequestNoteKey;
+    this.discussionController?.abort();
+    this.discussionController = null;
+    this.discussionRequestNoteKey = null;
+
+    if (previousKey) {
+      const previous = this.discussionSessions.get(previousKey);
+      if (previous) {
+        previous.status = "idle";
+        previous.streamingText = "";
+      }
+    }
+  }
+
+  private isCurrentDiscussionRequest(
+    controller: AbortController,
+    noteKey: string
+  ): boolean {
+    return (
+      !controller.signal.aborted &&
+      this.discussionController === controller &&
+      this.discussionRequestNoteKey === noteKey
+    );
   }
 
   async testConnection(): Promise<void> {
@@ -471,51 +620,108 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Provider").setHeading();
 
+    const providerOptions = getProviderOptions();
+    const selectedProvider =
+      providerOptions.find((provider) => provider.id === settings.providerId) ??
+      providerOptions[0];
+
     new Setting(containerEl)
-      .setName("API base URL")
+      .setName("Provider")
       .setDesc(
-        "OpenAI-compatible API root, for example https://api.openai.com/v1. /chat/completions is appended automatically."
+        "Built-in providers and model catalogs come from pi-ai. Choose Custom only for your own OpenAI-compatible endpoint."
       )
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_API_BASE_URL)
-          .setValue(settings.baseUrl)
-          .onChange(async (value) => {
-            settings.baseUrl = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+      .addDropdown((dropdown) => {
+        for (const provider of providerOptions) {
+          dropdown.addOption(provider.id, provider.name);
+        }
+        dropdown.setValue(settings.providerId).onChange(async (value) => {
+          settings.providerId = value;
+          if (value !== "custom") {
+            const models = getProviderModels(value);
+            const current = getProviderModel(settings);
+            if (!models.some((model) => model.id === current) && models[0]) {
+              setProviderModel(settings, models[0].id);
+            }
+          }
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
 
     new Setting(containerEl)
       .setName("API key")
-      .setDesc("Optional for local providers that do not require authentication.")
+      .setDesc(`Stored separately for ${selectedProvider.name}.`)
       .addText((text) => {
         text
-          .setPlaceholder("sk-…")
-          .setValue(settings.apiKey)
+          .setPlaceholder("API key")
+          .setValue(getProviderApiKey(settings))
           .onChange(async (value) => {
-            settings.apiKey = value.trim();
+            setProviderApiKey(settings, value.trim());
             await this.plugin.saveSettings();
           });
         text.inputEl.type = "password";
       });
 
-    new Setting(containerEl)
-      .setName("Model")
-      .setDesc("Exact model name accepted by your provider.")
-      .addText((text) =>
-        text
-          .setPlaceholder("gpt-4o-mini")
-          .setValue(settings.model)
-          .onChange(async (value) => {
-            settings.model = value.trim();
+    if (settings.providerId === "custom") {
+      new Setting(containerEl)
+        .setName("API base URL")
+        .setDesc(
+          "Root of your OpenAI-compatible API, for example http://127.0.0.1:18180/v1."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_API_BASE_URL)
+            .setValue(settings.baseUrl)
+            .onChange(async (value) => {
+              settings.baseUrl = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(containerEl)
+        .setName("Model")
+        .setDesc("Exact model id accepted by the custom endpoint.")
+        .addText((text) =>
+          text
+            .setPlaceholder("model-id")
+            .setValue(getProviderModel(settings))
+            .onChange(async (value) => {
+              setProviderModel(settings, value.trim());
+              await this.plugin.saveSettings();
+            })
+        );
+    } else {
+      const models = getProviderModels(settings.providerId);
+      const selectedModel = getProviderModel(settings);
+      const selectedModelInfo = models.find((model) => model.id === selectedModel);
+
+      new Setting(containerEl)
+        .setName("Model")
+        .setDesc(
+          selectedModelInfo
+            ? `${models.length} models in the pi-ai catalog. ${
+                selectedModelInfo.reasoning ? "Reasoning model." : "Non-reasoning model."
+              } Max output: ${selectedModelInfo.maxTokens.toLocaleString()} tokens.`
+            : `${models.length} models in the pi-ai catalog.`
+        )
+        .addDropdown((dropdown) => {
+          if (selectedModel && !models.some((model) => model.id === selectedModel)) {
+            dropdown.addOption(selectedModel, `${selectedModel} (not in catalog)`);
+          }
+          for (const model of models) {
+            dropdown.addOption(model.id, model.name);
+          }
+          dropdown.setValue(selectedModel).onChange(async (value) => {
+            setProviderModel(settings, value);
             await this.plugin.saveSettings();
-          })
-      );
+            this.display();
+          });
+        });
+    }
 
     new Setting(containerEl)
       .setName("Connection")
-      .setDesc("Send a small completion request using the current settings.")
+      .setDesc("Send a small completion request using the current provider and model.")
       .addButton((button) =>
         button.setButtonText("Test").onClick(() => void this.plugin.testConnection())
       );
@@ -525,7 +731,7 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
     addReasoningSetting(
       containerEl,
       "Completion reasoning",
-      "Provider default sends no reasoning_effort field. Low/none are usually best for latency-sensitive autocomplete.",
+      "Provider default requests no explicit reasoning level. Minimal/None is provider-specific; Low is usually the highest useful setting for latency-sensitive autocomplete.",
       settings.completionReasoningEffort,
       async (value) => {
         settings.completionReasoningEffort = value;
@@ -533,19 +739,16 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
       }
     );
 
-    new Setting(containerEl)
-      .setName("Maximum tokens")
-      .setDesc("Keep this low for fast, concise inline suggestions.")
-      .addSlider((slider) =>
-        slider
-          .setLimits(32, 256, 16)
-          .setValue(settings.maxTokens)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            settings.maxTokens = value;
-            await this.plugin.saveSettings();
-          })
-      );
+    addTokenBudgetSetting(
+      containerEl,
+      "Maximum output tokens",
+      "Maximum output budget, including reasoning tokens when the model uses them. You can enter any value from 16 to 65,536.",
+      settings.maxTokens,
+      async (value) => {
+        settings.maxTokens = value;
+        await this.plugin.saveSettings();
+      }
+    );
 
     new Setting(containerEl)
       .setName("Temperature")
@@ -572,13 +775,11 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
         for (const template of settings.promptTemplates) {
           dropdown.addOption(template.id, template.name);
         }
-        dropdown
-          .setValue(activeTemplate.id)
-          .onChange(async (value) => {
-            settings.activePromptTemplateId = value;
-            await this.plugin.saveSettings();
-            this.display();
-          });
+        dropdown.setValue(activeTemplate.id).onChange(async (value) => {
+          settings.activePromptTemplateId = value;
+          await this.plugin.saveSettings();
+          this.display();
+        });
       });
 
     new Setting(containerEl)
@@ -632,14 +833,12 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
       .setName("Template name")
       .setDesc("Rename the active completion prompt template.")
       .addText((text) =>
-        text
-          .setValue(activeTemplate.name)
-          .onChange(async (value) => {
-            const trimmed = value.trim();
-            if (!trimmed) return;
-            activeTemplate.name = trimmed;
-            await this.plugin.saveSettings();
-          })
+        text.setValue(activeTemplate.name).onChange(async (value) => {
+          const trimmed = value.trim();
+          if (!trimmed) return;
+          activeTemplate.name = trimmed;
+          await this.plugin.saveSettings();
+        })
       );
 
     new Setting(containerEl)
@@ -668,24 +867,24 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl).setName("Discussion").setHeading();
+    new Setting(containerEl).setName("Discussion sidebar").setHeading();
 
     new Setting(containerEl)
-      .setName("Ask / continue discussion")
+      .setName("Discuss selection")
       .setDesc(
-        "Select text, then run “AI Autocomplete: Ask / continue discussion about selection”. Assign a shortcut in Obsidian Settings → Hotkeys."
+        "Select text in a Markdown note and run “AI Autocomplete: Discuss selection in sidebar”. The selection is pinned as reference; then ask questions in the sidebar."
       );
 
     new Setting(containerEl)
       .setName("Session behavior")
       .setDesc(
-        "Discussion remembers a short Q/A history per note for the current Obsidian session. Autocomplete never uses this history."
+        "Each note keeps its own short in-memory discussion history. Changing the editor selection or cursor does not clear it, and inline autocomplete never receives discussion history."
       );
 
     addReasoningSetting(
       containerEl,
       "Discussion reasoning",
-      "Provider default sends no reasoning_effort field. Use medium/high only when the configured provider supports it.",
+      "Provider default requests no explicit reasoning level. Larger reasoning levels may need a much larger output-token budget.",
       settings.discussionReasoningEffort,
       async (value) => {
         settings.discussionReasoningEffort = value;
@@ -693,23 +892,20 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
       }
     );
 
-    new Setting(containerEl)
-      .setName("Discussion maximum tokens")
-      .setDesc("Discussion answers can be longer than inline completions.")
-      .addSlider((slider) =>
-        slider
-          .setLimits(128, 1024, 64)
-          .setValue(settings.discussionMaxTokens)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            settings.discussionMaxTokens = value;
-            await this.plugin.saveSettings();
-          })
-      );
+    addTokenBudgetSetting(
+      containerEl,
+      "Discussion output tokens",
+      "Total output budget for the sidebar answer, including reasoning tokens. Values up to 65,536 are allowed.",
+      settings.discussionMaxTokens,
+      async (value) => {
+        settings.discussionMaxTokens = value;
+        await this.plugin.saveSettings();
+      }
+    );
 
     new Setting(containerEl)
       .setName("Discussion prompt")
-      .setDesc("System prompt used only for selected-text discussions.")
+      .setDesc("System prompt used only by the discussion sidebar.")
       .addTextArea((text) => {
         text.inputEl.rows = 12;
         text.inputEl.cols = 60;
@@ -724,7 +920,7 @@ class AIAutocompleteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Reset discussion prompt")
-      .setDesc("Restore the built-in concise discussion prompt.")
+      .setDesc("Restore the built-in discussion prompt.")
       .addButton((button) =>
         button.setButtonText("Reset prompt").onClick(async () => {
           settings.discussionPrompt = DEFAULT_DISCUSSION_PROMPT;
@@ -748,7 +944,7 @@ function addReasoningSetting(
     .addDropdown((dropdown) =>
       dropdown
         .addOption("", "Provider default (do not send)")
-        .addOption("none", "None")
+        .addOption("none", "Minimal / None (provider-specific)")
         .addOption("low", "Low")
         .addOption("medium", "Medium")
         .addOption("high", "High")
@@ -759,68 +955,40 @@ function addReasoningSetting(
     );
 }
 
-function normalizeTemplates(
-  templates: PromptTemplate[] | undefined,
-  fallbackPrompt: string
-): PromptTemplate[] {
-  if (!Array.isArray(templates) || templates.length === 0) {
-    return [
-      {
-        id: DEFAULT_TEMPLATE_ID,
-        name: "Default",
-        prompt: fallbackPrompt,
-      },
-    ];
-  }
-
-  const valid = templates
-    .filter(
-      (template) =>
-        template &&
-        typeof template.id === "string" &&
-        typeof template.name === "string" &&
-        typeof template.prompt === "string"
-    )
-    .map((template) => ({ ...template }));
-
-  return valid.length > 0
-    ? valid
-    : [
-        {
-          id: DEFAULT_TEMPLATE_ID,
-          name: "Default",
-          prompt: fallbackPrompt,
-        },
-      ];
+function addTokenBudgetSetting(
+  containerEl: HTMLElement,
+  name: string,
+  description: string,
+  value: number,
+  onChange: (value: number) => Promise<void>
+): void {
+  new Setting(containerEl)
+    .setName(name)
+    .setDesc(description)
+    .addText((text) => {
+      text.inputEl.type = "number";
+      text.inputEl.min = "16";
+      text.inputEl.max = "65536";
+      text.inputEl.step = "16";
+      text.setValue(String(value)).onChange(async (raw) => {
+        if (!raw.trim()) return;
+        await onChange(normalizeTokenBudget(raw, value));
+      });
+      text.inputEl.addEventListener("blur", () => {
+        const normalized = normalizeTokenBudget(text.inputEl.value, value);
+        text.inputEl.value = String(normalized);
+      });
+    });
 }
 
-function normalizeEagerness(value: number): number {
-  return Math.min(5, Math.max(1, Math.round(value)));
-}
-
-function normalizeReasoningEffort(value: unknown): ReasoningEffort {
-  return value === "none" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high"
-    ? value
-    : "";
-}
-
-function createTemplateId(): string {
-  return `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
-function uniqueTemplateName(
-  templates: PromptTemplate[],
-  preferredName: string
-): string {
-  const names = new Set(templates.map((template) => template.name));
-  if (!names.has(preferredName)) return preferredName;
-
-  let index = 2;
-  while (names.has(`${preferredName} ${index}`)) index += 1;
-  return `${preferredName} ${index}`;
+function createDiscussionSession(): DiscussionSession {
+  return {
+    reference: "",
+    turns: [],
+    status: "idle",
+    streamingText: "",
+    error: "",
+  };
 }
 
 function cmOf(editor: Editor): EditorView | null {
@@ -833,4 +1001,21 @@ function withView(
 ): void {
   const view = cmOf(editor);
   if (view) action(view);
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value.replace(/[&"<>]/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case '"':
+        return "&quot;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      default:
+        return character;
+    }
+  });
 }
