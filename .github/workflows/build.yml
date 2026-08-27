@@ -14,9 +14,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm install
       - run: npm run build
       - name: Prepare Obsidian plugin artifact
         run: |
@@ -26,3 +26,7 @@ jobs:
         with:
           name: ai-autocomplete-dev
           path: dist/ai-autocomplete
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-lock
+          path: package-lock.json
