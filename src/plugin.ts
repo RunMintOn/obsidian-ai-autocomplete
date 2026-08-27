@@ -283,16 +283,17 @@ export default class AIAutocompletePlugin
     reasoningEffort: ReasoningEffort,
     systemPrompt?: string
   ): CompletionRequestOptions {
-    return {
+    const options: CompletionRequestOptions = {
       providerId: this.settings.providerId,
       apiKey: getProviderApiKey(this.settings),
       model,
       baseUrl: this.settings.baseUrl,
-      systemPrompt,
       temperature: this.settings.temperature,
       maxTokens,
       reasoningEffort,
     };
+    if (systemPrompt !== undefined) options.systemPrompt = systemPrompt;
+    return options;
   }
 
   getDiscussionSnapshot(): DiscussionSnapshot {
@@ -517,13 +518,12 @@ export default class AIAutocompletePlugin
       return;
     }
 
-    const sidebarView = leaf.view;
-    if (!(sidebarView instanceof DiscussionSidebarView)) return;
+    if (!(leaf.view instanceof DiscussionSidebarView)) return;
 
-    sidebarView.refresh();
+    leaf.view.refresh();
     if (focusInput) {
-      requestAnimationFrame(function focusSidebarInput(): void {
-        sidebarView.focusInput();
+      requestAnimationFrame(() => {
+        if (leaf.view instanceof DiscussionSidebarView) leaf.view.focusInput();
       });
     }
   }
@@ -546,7 +546,8 @@ export default class AIAutocompletePlugin
       );
     }
 
-    let leaf = workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)[0] ?? null;
+    let leaf: WorkspaceLeaf | null =
+      workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)[0] ?? null;
     if (!leaf) {
       leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
       if (leaf) {
