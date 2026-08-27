@@ -20,12 +20,39 @@
 }
 
 .ai-autocomplete-discussion-label {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
   margin-bottom: 0.25em;
   font-size: 0.8em;
   font-weight: 600;
-  opacity: 0.7;
+  opacity: 0.75;
+}
+
+.ai-autocomplete-discussion-status {
+  font-weight: 400;
+  opacity: 0.75;
+}
+
+.ai-autocomplete-discussion-ghost.is-loading .ai-autocomplete-discussion-status,
+.ai-autocomplete-discussion-ghost.is-streaming .ai-autocomplete-discussion-status {
+  animation: ai-autocomplete-pulse 1.25s ease-in-out infinite;
 }
 
 .ai-autocomplete-discussion-body {
   line-height: 1.5;
+}
+
+.ai-autocomplete-discussion-ghost.is-loading .ai-autocomplete-discussion-body,
+.ai-autocomplete-discussion-ghost.is-streaming .ai-autocomplete-discussion-body {
+  color: var(--text-faint);
+}
+
+.ai-autocomplete-discussion-ghost.is-error {
+  border-left-color: var(--text-error);
+}
+
+@keyframes ai-autocomplete-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
 }
