@@ -1,12 +1,15 @@
 {
   "name": "obsidian-ai-autocomplete",
   "version": "1.0.5",
-  "description": "AI inline auto-completion for Obsidian powered by OpenAI-compatible APIs",
+  "description": "AI inline auto-completion for Obsidian powered by pi-ai",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && node esbuild.config.mjs production"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.3"
   },
   "devDependencies": {
     "@codemirror/state": "^6.0.0",
