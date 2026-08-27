@@ -123,6 +123,10 @@
   white-space: pre-wrap;
 }
 
+.ai-autocomplete-chat-content.is-placeholder {
+  color: var(--text-faint);
+}
+
 .ai-autocomplete-chat-message.is-user .ai-autocomplete-chat-content {
   background: var(--background-secondary-alt);
 }
@@ -136,6 +140,35 @@
   content: "▍";
   margin-left: 0.08rem;
   animation: ai-autocomplete-caret 0.9s step-end infinite;
+}
+
+.ai-autocomplete-thinking {
+  margin: 0 0 0.45rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary-alt);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-thinking summary {
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+}
+
+.ai-autocomplete-thinking-content {
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0 0.55rem 0.55rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.ai-autocomplete-chat-message.is-streaming .ai-autocomplete-thinking[open] summary::after {
+  content: " …";
+  animation: ai-autocomplete-pulse 1.25s ease-in-out infinite;
 }
 
 .ai-autocomplete-chat-status {
@@ -165,6 +198,35 @@
   background: var(--background-primary);
 }
 
+.ai-autocomplete-chat-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) 5.5rem;
+  gap: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.ai-autocomplete-chat-controls select,
+.ai-autocomplete-chat-controls input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 2rem;
+  padding: 0 0.35rem;
+  font-size: var(--font-ui-smaller);
+}
+
+.ai-autocomplete-control-model {
+  min-width: 0;
+}
+
+.ai-autocomplete-reasoning-hint {
+  min-height: 1.15rem;
+  margin-bottom: 0.35rem;
+  color: var(--text-faint);
+  font-size: 0.72em;
+  line-height: 1.35;
+}
+
 .ai-autocomplete-chat-input {
   box-sizing: border-box;
   width: 100%;
@@ -184,6 +246,16 @@
 .ai-autocomplete-chat-hint {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
+}
+
+@media (max-width: 360px) {
+  .ai-autocomplete-chat-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ai-autocomplete-control-tokens {
+    grid-column: span 2;
+  }
 }
 
 @keyframes ai-autocomplete-pulse {
