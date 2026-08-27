@@ -1,3 +1,4 @@
+import type { EditorView } from "@codemirror/view";
 import {
   Editor,
   MarkdownView,
@@ -5,8 +6,6 @@ import {
   Plugin,
   WorkspaceLeaf,
 } from "obsidian";
-import type { Extension } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
 import {
   type ChatMessage,
   CompletionError,
@@ -16,14 +15,14 @@ import {
   type CompletionRequestOptions,
   type ReasoningEffort,
   streamChatCompletion,
-} from "./ai-client";
+} from "./ai-client.js";
 import {
   DiscussionSidebarView,
   type DiscussionRunStatus,
   type DiscussionSidebarHost,
   type DiscussionSnapshot,
   VIEW_TYPE_AI_DISCUSSION,
-} from "./discussion-sidebar";
+} from "./discussion-sidebar.js";
 import {
   acceptSuggestion,
   acceptSuggestionSegment,
@@ -32,8 +31,8 @@ import {
   getSuggestionManager,
   inlineSuggestionExtension,
   type InlineSuggestionConfig,
-} from "./ghost-text";
-import { tr } from "./i18n";
+} from "./ghost-text.js";
+import { tr } from "./i18n.js";
 import {
   type AIAutocompleteSettings,
   DEFAULT_SETTINGS,
@@ -45,11 +44,11 @@ import {
   normalizeReasoningEffort,
   normalizeTokenBudget,
   setDiscussionProviderModel,
-} from "./settings";
+} from "./settings.js";
 import {
   AIAutocompleteSettingTab,
   type SettingsHost,
-} from "./settings-tab";
+} from "./settings-tab.js";
 
 interface DiscussionTurn {
   role: "user" | "assistant";
@@ -67,13 +66,14 @@ interface DiscussionSession {
 }
 
 const MAX_DISCUSSION_TURNS = 12;
+const ACTIVE_EDITOR_NOTE_KEY = "__active-editor__";
 
 export default class AIAutocompletePlugin
   extends Plugin
   implements DiscussionSidebarHost, SettingsHost
 {
   settings: AIAutocompleteSettings = DEFAULT_SETTINGS;
-  private editorExtensions: Extension[] = [];
+
   private lastErrorNoticeAt = 0;
   private readonly discussionSessions = new Map<string, DiscussionSession>();
   private discussionController: AbortController | null = null;
@@ -85,7 +85,7 @@ export default class AIAutocompletePlugin
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    this.editorExtensions = inlineSuggestionExtension(
+    const editorExtensions = inlineSuggestionExtension(
       async ({ prefix, suffix, signal }) => {
         try {
           return await fetchCompletion(
@@ -95,7 +95,7 @@ export default class AIAutocompletePlugin
             signal
           );
         } catch (error) {
-          if (error instanceof Error && error.name === "AbortError") return null;
+          if (isAbortError(error)) return null;
           this.showCompletionError(error);
           return null;
         }
@@ -103,7 +103,7 @@ export default class AIAutocompletePlugin
       () => this.getInlineConfig()
     );
 
-    this.registerEditorExtension(this.editorExtensions);
+    this.registerEditorExtension(editorExtensions);
     this.registerView(
       VIEW_TYPE_AI_DISCUSSION,
       (leaf) => new DiscussionSidebarView(leaf, this)
@@ -124,11 +124,11 @@ export default class AIAutocompletePlugin
 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
-        if (leaf?.view instanceof MarkdownView) {
-          this.lastMarkdownView = leaf.view;
-          if (leaf.view.file?.path) this.discussionNoteKey = leaf.view.file.path;
-          this.refreshSidebar();
-        }
+        if (!(leaf?.view instanceof MarkdownView)) return;
+
+        this.lastMarkdownView = leaf.view;
+        if (leaf.view.file?.path) this.discussionNoteKey = leaf.view.file.path;
+        this.refreshSidebar();
       })
     );
 
@@ -222,11 +222,12 @@ export default class AIAutocompletePlugin
         this.settings.autoEnabled = !this.settings.autoEnabled;
         if (!this.settings.autoEnabled) clearAllSuggestions();
         void this.saveSettings();
-        new Notice(
-          this.settings.autoEnabled
-            ? this.l("AI 自动补全：已开启", "AI autocomplete: on")
-            : this.l("AI 自动补全：已关闭", "AI autocomplete: off")
-        );
+
+        if (this.settings.autoEnabled) {
+          new Notice(this.l("AI 自动补全：已开启", "AI autocomplete: on"));
+          return;
+        }
+        new Notice(this.l("AI 自动补全：已关闭", "AI autocomplete: off"));
       },
     });
 
@@ -260,39 +261,53 @@ export default class AIAutocompletePlugin
   }
 
   private getCompletionOptions(): CompletionRequestOptions {
-    return {
-      providerId: this.settings.providerId,
-      apiKey: getProviderApiKey(this.settings),
-      model: getProviderModel(this.settings),
-      baseUrl: this.settings.baseUrl,
-      systemPrompt: getActivePromptTemplate(this.settings).prompt,
-      temperature: this.settings.temperature,
-      maxTokens: this.settings.maxTokens,
-      reasoningEffort: this.settings.completionReasoningEffort,
-    };
+    return this.getRequestOptions(
+      getProviderModel(this.settings),
+      this.settings.maxTokens,
+      this.settings.completionReasoningEffort,
+      getActivePromptTemplate(this.settings).prompt
+    );
   }
 
   private getDiscussionOptions(): CompletionRequestOptions {
+    return this.getRequestOptions(
+      getDiscussionProviderModel(this.settings),
+      this.settings.discussionMaxTokens,
+      this.settings.discussionReasoningEffort
+    );
+  }
+
+  private getRequestOptions(
+    model: string,
+    maxTokens: number,
+    reasoningEffort: ReasoningEffort,
+    systemPrompt?: string
+  ): CompletionRequestOptions {
     return {
       providerId: this.settings.providerId,
       apiKey: getProviderApiKey(this.settings),
-      model: getDiscussionProviderModel(this.settings),
+      model,
       baseUrl: this.settings.baseUrl,
+      systemPrompt,
       temperature: this.settings.temperature,
-      maxTokens: this.settings.discussionMaxTokens,
-      reasoningEffort: this.settings.discussionReasoningEffort,
+      maxTokens,
+      reasoningEffort,
     };
   }
 
   getDiscussionSnapshot(): DiscussionSnapshot {
     const noteKey = this.currentDiscussionNoteKey();
     const session = this.getDiscussionSession(noteKey);
-    const provider = getProviderOptions().find(
-      (item) => item.id === this.settings.providerId
-    );
+    const provider = getProviderOptions().find((item) => {
+      return item.id === this.settings.providerId;
+    });
     const modelId = getDiscussionProviderModel(this.settings);
+
+    let notePath: string | null = noteKey;
+    if (noteKey === ACTIVE_EDITOR_NOTE_KEY) notePath = null;
+
     return {
-      notePath: noteKey === "__active-editor__" ? null : noteKey,
+      notePath,
       reference: session.reference,
       turns: session.turns,
       status: session.status,
@@ -311,8 +326,10 @@ export default class AIAutocompletePlugin
   }
 
   async setDiscussionModel(modelId: string): Promise<void> {
-    if (!modelId.trim()) return;
-    setDiscussionProviderModel(this.settings, modelId.trim());
+    const model = modelId.trim();
+    if (!model) return;
+
+    setDiscussionProviderModel(this.settings, model);
     await this.saveSettings();
     this.refreshSidebar();
   }
@@ -345,24 +362,17 @@ export default class AIAutocompletePlugin
     session.turns.push({ role: "user", content: trimmedQuestion });
     this.trimDiscussionTurns(session);
     session.status = "thinking";
-    session.streamingThinking = "";
-    session.streamingText = "";
+    clearStreamingOutput(session);
     session.error = "";
     this.refreshSidebar();
 
-    const messages: ChatMessage[] = [
-      { role: "system", content: this.settings.discussionPrompt },
-      ...previousTurns.map((turn) => ({
-        role: turn.role,
-        content: turn.content,
-      })),
-      {
-        role: "user",
-        content: reference
-          ? `<reference note="${escapeXmlAttribute(noteKey)}">\n${reference}\n</reference>\n\n<question>\n${trimmedQuestion}\n</question>`
-          : trimmedQuestion,
-      },
-    ];
+    const messages = buildDiscussionMessages(
+      this.settings.discussionPrompt,
+      previousTurns,
+      noteKey,
+      reference,
+      trimmedQuestion
+    );
 
     const controller = new AbortController();
     this.discussionController = controller;
@@ -409,16 +419,14 @@ export default class AIAutocompletePlugin
       });
       this.trimDiscussionTurns(session);
       session.status = "idle";
-      session.streamingThinking = "";
-      session.streamingText = "";
+      clearStreamingOutput(session);
       session.error = "";
       this.refreshSidebar();
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isAbortError(error)) {
         if (this.discussionRequestNoteKey === noteKey) {
           session.status = "idle";
-          session.streamingThinking = "";
-          session.streamingText = "";
+          clearStreamingOutput(session);
           this.refreshSidebar();
         }
         return;
@@ -426,8 +434,7 @@ export default class AIAutocompletePlugin
 
       session.status = "error";
       session.error = this.errorMessage(error);
-      session.streamingThinking = "";
-      session.streamingText = "";
+      clearStreamingOutput(session);
       console.error("AI autocomplete: discussion error", error);
       this.refreshSidebar();
     } finally {
@@ -462,6 +469,7 @@ export default class AIAutocompletePlugin
   newDiscussion(): void {
     const noteKey = this.currentDiscussionNoteKey();
     if (this.discussionRequestNoteKey === noteKey) this.abortDiscussionRequest();
+
     this.discussionSessions.set(noteKey, createDiscussionSession());
     this.refreshSidebar();
   }
@@ -501,6 +509,26 @@ export default class AIAutocompletePlugin
   }
 
   private async activateDiscussionSidebar(focusInput: boolean): Promise<void> {
+    const leaf = await this.getDiscussionSidebarLeaf();
+    if (!leaf) {
+      new Notice(
+        this.l("无法打开 AI 讨论侧栏", "Could not open the AI discussion sidebar")
+      );
+      return;
+    }
+
+    const sidebarView = leaf.view;
+    if (!(sidebarView instanceof DiscussionSidebarView)) return;
+
+    sidebarView.refresh();
+    if (focusInput) {
+      requestAnimationFrame(function focusSidebarInput(): void {
+        sidebarView.focusInput();
+      });
+    }
+  }
+
+  private async getDiscussionSidebarLeaf(): Promise<WorkspaceLeaf | null> {
     const workspace = this.app.workspace;
     const workspaceWithSideLeaf = workspace as typeof workspace & {
       ensureSideLeaf?: (
@@ -510,38 +538,27 @@ export default class AIAutocompletePlugin
       ) => Promise<WorkspaceLeaf>;
     };
 
-    let leaf: WorkspaceLeaf | null = null;
     if (typeof workspaceWithSideLeaf.ensureSideLeaf === "function") {
-      leaf = await workspaceWithSideLeaf.ensureSideLeaf(
+      return workspaceWithSideLeaf.ensureSideLeaf(
         VIEW_TYPE_AI_DISCUSSION,
         "right",
         { active: true, reveal: true }
       );
-    } else {
-      leaf = workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)[0] ?? null;
-      if (!leaf) {
-        leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
-        if (leaf) {
-          await leaf.setViewState({
-            type: VIEW_TYPE_AI_DISCUSSION,
-            active: true,
-          });
-        }
-      }
-      if (leaf) await workspace.revealLeaf(leaf);
     }
 
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_AI_DISCUSSION)[0] ?? null;
     if (!leaf) {
-      new Notice(
-        this.l("无法打开 AI 讨论侧栏", "Could not open the AI discussion sidebar")
-      );
-      return;
+      leaf = workspace.getRightLeaf(false) ?? workspace.getRightLeaf(true);
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_AI_DISCUSSION,
+          active: true,
+        });
+      }
     }
 
-    if (leaf.view instanceof DiscussionSidebarView) {
-      leaf.view.refresh();
-      if (focusInput) requestAnimationFrame(() => leaf.view instanceof DiscussionSidebarView && leaf.view.focusInput());
-    }
+    if (leaf) await workspace.revealLeaf(leaf);
+    return leaf;
   }
 
   private refreshSidebar(): void {
@@ -552,6 +569,7 @@ export default class AIAutocompletePlugin
 
   private queueSidebarRefresh(): void {
     if (this.sidebarRefreshQueued) return;
+
     this.sidebarRefreshQueued = true;
     requestAnimationFrame(() => {
       this.sidebarRefreshQueued = false;
@@ -564,23 +582,22 @@ export default class AIAutocompletePlugin
       this.discussionNoteKey ??
       this.lastMarkdownView?.file?.path ??
       this.app.workspace.getActiveFile()?.path ??
-      "__active-editor__"
+      ACTIVE_EDITOR_NOTE_KEY
     );
   }
 
   private getDiscussionSession(noteKey: string): DiscussionSession {
-    let session = this.discussionSessions.get(noteKey);
-    if (!session) {
-      session = createDiscussionSession();
-      this.discussionSessions.set(noteKey, session);
-    }
+    const existingSession = this.discussionSessions.get(noteKey);
+    if (existingSession) return existingSession;
+
+    const session = createDiscussionSession();
+    this.discussionSessions.set(noteKey, session);
     return session;
   }
 
   private trimDiscussionTurns(session: DiscussionSession): void {
-    if (session.turns.length > MAX_DISCUSSION_TURNS) {
-      session.turns.splice(0, session.turns.length - MAX_DISCUSSION_TURNS);
-    }
+    if (session.turns.length <= MAX_DISCUSSION_TURNS) return;
+    session.turns.splice(0, session.turns.length - MAX_DISCUSSION_TURNS);
   }
 
   private abortDiscussionRequest(): void {
@@ -589,14 +606,13 @@ export default class AIAutocompletePlugin
     this.discussionController = null;
     this.discussionRequestNoteKey = null;
 
-    if (previousKey) {
-      const previous = this.discussionSessions.get(previousKey);
-      if (previous) {
-        previous.status = "idle";
-        previous.streamingThinking = "";
-        previous.streamingText = "";
-      }
-    }
+    if (!previousKey) return;
+
+    const previousSession = this.discussionSessions.get(previousKey);
+    if (!previousSession) return;
+
+    previousSession.status = "idle";
+    clearStreamingOutput(previousSession);
   }
 
   private isCurrentDiscussionRequest(
@@ -612,6 +628,7 @@ export default class AIAutocompletePlugin
 
   async testConnection(): Promise<void> {
     const controller = new AbortController();
+
     try {
       const result = await fetchCompletion(
         this.getCompletionOptions(),
@@ -620,11 +637,12 @@ export default class AIAutocompletePlugin
         controller.signal
       );
       const sample = result?.replace(/\s+/g, " ").slice(0, 50);
-      new Notice(
-        sample
-          ? this.l(`连接成功：${sample}`, `Connected — ${sample}`)
-          : this.l("连接成功", "Connected")
-      );
+
+      if (sample) {
+        new Notice(this.l(`连接成功：${sample}`, `Connected — ${sample}`));
+        return;
+      }
+      new Notice(this.l("连接成功", "Connected"));
     } catch (error) {
       this.showCompletionError(error, true);
     }
@@ -632,17 +650,17 @@ export default class AIAutocompletePlugin
 
   private showCompletionError(error: unknown, forceNotice = false): void {
     console.error("AI autocomplete: completion error", error);
+
     const now = Date.now();
     if (!forceNotice && now - this.lastErrorNoticeAt < 10000) return;
+
     this.lastErrorNoticeAt = now;
     new Notice(`AI Autocomplete: ${this.errorMessage(error)}`);
   }
 
   private errorMessage(error: unknown): string {
-    const message =
-      error instanceof CompletionError || error instanceof Error
-        ? error.message
-        : this.l("未知错误", "Unknown error");
+    let message = this.l("未知错误", "Unknown error");
+    if (error instanceof Error) message = error.message;
 
     if (message.includes("reached the output limit while reasoning")) {
       return this.l(
@@ -660,12 +678,14 @@ export default class AIAutocompletePlugin
         "No reasoning level is sent; the provider/model uses its default behavior."
       );
     }
+
     if (this.settings.providerId === "custom" && value === "minimal") {
       return this.l(
         "pi-ai: reasoning=minimal → Custom OpenAI: reasoning_effort=none",
         "pi-ai: reasoning=minimal → Custom OpenAI: reasoning_effort=none"
       );
     }
+
     return this.l(
       `pi-ai: reasoning=${value}；由 ${this.settings.providerId} adapter 映射到实际请求字段。`,
       `pi-ai: reasoning=${value}; the ${this.settings.providerId} adapter maps it to the wire format.`
@@ -688,6 +708,39 @@ function createDiscussionSession(): DiscussionSession {
   };
 }
 
+function clearStreamingOutput(session: DiscussionSession): void {
+  session.streamingThinking = "";
+  session.streamingText = "";
+}
+
+function buildDiscussionMessages(
+  systemPrompt: string,
+  previousTurns: DiscussionTurn[],
+  noteKey: string,
+  reference: string,
+  question: string
+): ChatMessage[] {
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemPrompt },
+  ];
+
+  for (const turn of previousTurns) {
+    messages.push({ role: turn.role, content: turn.content });
+  }
+
+  let userContent = question;
+  if (reference) {
+    userContent = `<reference note="${escapeXmlAttribute(noteKey)}">\n${reference}\n</reference>\n\n<question>\n${question}\n</question>`;
+  }
+  messages.push({ role: "user", content: userContent });
+
+  return messages;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function cmOf(editor: Editor): EditorView | null {
   return (editor as unknown as { cm?: EditorView }).cm ?? null;
 }
@@ -701,7 +754,7 @@ function withView(
 }
 
 function escapeXmlAttribute(value: string): string {
-  return value.replace(/[&"<>]/g, (character) => {
+  return value.replace(/[&"<>]/g, function escapeCharacter(character): string {
     switch (character) {
       case "&":
         return "&amp;";
