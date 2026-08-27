@@ -25,6 +25,7 @@ export interface DiscussionSnapshot {
 export interface DiscussionSidebarHost {
   getDiscussionSnapshot(): DiscussionSnapshot;
   sendDiscussion(question: string): Promise<void>;
+  cancelDiscussion(): void;
   newDiscussion(): void;
   clearDiscussionReference(): void;
   captureCurrentSelection(): boolean;
@@ -39,6 +40,7 @@ export class DiscussionSidebarView extends ItemView {
   private statusEl: HTMLElement | null = null;
   private inputEl: HTMLTextAreaElement | null = null;
   private sendButtonEl: HTMLButtonElement | null = null;
+  private busy = false;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -95,9 +97,13 @@ export class DiscussionSidebarView extends ItemView {
     this.renderMessages(snapshot);
     this.renderStatus(snapshot);
 
-    const busy =
+    this.busy =
       snapshot.status === "thinking" || snapshot.status === "generating";
-    if (this.sendButtonEl) this.sendButtonEl.disabled = busy;
+    if (this.sendButtonEl) {
+      this.sendButtonEl.textContent = this.busy ? "Stop" : "Send";
+      this.sendButtonEl.toggleClass("mod-cta", !this.busy);
+      this.sendButtonEl.toggleClass("mod-warning", this.busy);
+    }
   }
 
   focusInput(): void {
@@ -189,7 +195,7 @@ export class DiscussionSidebarView extends ItemView {
     this.inputEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
-        void this.submit();
+        if (!this.busy) void this.submit();
       }
     });
 
@@ -204,7 +210,10 @@ export class DiscussionSidebarView extends ItemView {
       cls: "mod-cta",
       text: "Send",
     });
-    this.sendButtonEl.addEventListener("click", () => void this.submit());
+    this.sendButtonEl.addEventListener("click", () => {
+      if (this.busy) this.host.cancelDiscussion();
+      else void this.submit();
+    });
   }
 
   private renderMessages(snapshot: DiscussionSnapshot): void {
@@ -281,7 +290,7 @@ export class DiscussionSidebarView extends ItemView {
 
   private async submit(): Promise<void> {
     const input = this.inputEl;
-    if (!input) return;
+    if (!input || this.busy) return;
     const question = input.value.trim();
     if (!question) return;
 
