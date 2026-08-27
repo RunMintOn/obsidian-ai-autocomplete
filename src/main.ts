@@ -185,9 +185,6 @@ export default class AIAutocompletePlugin
       callback: () => void this.activateDiscussionSidebar(true),
     });
 
-    // Keep the historical command id so existing hotkey assignments survive,
-    // but change the behavior: pin the selection and open the sidebar. It does
-    // not automatically send the selection as a question.
     this.addCommand({
       id: "ask-selection",
       name: "Discuss selection in sidebar",
@@ -390,6 +387,22 @@ export default class AIAutocompletePlugin
         this.discussionRequestNoteKey = null;
       }
     }
+  }
+
+  cancelDiscussion(): void {
+    const noteKey = this.discussionRequestNoteKey;
+    const session = noteKey ? this.discussionSessions.get(noteKey) : undefined;
+    const partial = session?.streamingText.trim() ?? "";
+
+    this.abortDiscussionRequest();
+
+    if (session && partial) {
+      session.turns.push({ role: "assistant", content: partial });
+      this.trimDiscussionTurns(session);
+      session.status = "idle";
+      session.error = "";
+    }
+    this.refreshSidebar();
   }
 
   newDiscussion(): void {
