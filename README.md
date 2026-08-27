@@ -1,6 +1,6 @@
 # AI Autocomplete
 
-A lightweight inline AI completion plugin for Obsidian. It renders Copilot-style ghost text directly at the cursor and works with any OpenAI-compatible Chat Completions API.
+A lightweight inline AI completion plugin for Obsidian. It renders Copilot-style ghost text directly at the cursor and uses `@earendil-works/pi-ai` for model/provider request handling.
 
 ## Writing completion
 
@@ -39,24 +39,25 @@ Discussion keeps a short Q/A history per note for the current Obsidian session. 
 
 ## Provider setup
 
-The plugin intentionally has one provider contract: OpenAI-compatible `POST /chat/completions`.
+The plugin delegates Chat Completions parsing, streaming events, text/thinking separation, and provider compatibility behavior to **pi-ai**. The current UI exposes one configurable OpenAI-compatible pi-ai provider:
 
-Configure:
+- **API base URL** — for example `https://api.openai.com/v1` or `http://127.0.0.1:18180/v1`.
+- **API key** — used by pi-ai/OpenAI transport. A placeholder is used for keyless local endpoints.
+- **Model** — the exact model id accepted by the endpoint.
 
-- **API base URL** — for example `https://api.openai.com/v1`, `http://localhost:1234/v1`, or another compatible gateway. If the URL does not already end in `/chat/completions`, the plugin appends it.
-- **API key** — optional for local endpoints that do not require authentication.
-- **Model** — the exact model name accepted by the endpoint.
+Obsidian `requestUrl` is used as pi-ai's HTTP transport so desktop plugins can still reach local/custom endpoints without normal browser CORS restrictions. Response parsing itself is handled by pi-ai.
 
-This keeps the plugin compatible with OpenAI, OpenRouter, Groq-compatible gateways, LM Studio, vLLM, and other servers that expose the standard Chat Completions shape.
-
-## Reasoning effort
+## Reasoning
 
 Completion and discussion have separate reasoning settings:
 
-- **Provider default (do not send)** — the request body contains no `reasoning_effort` field.
-- **None / Low / Medium / High** — sends the selected value as `reasoning_effort` for providers/models that support it.
+- **Provider default (do not send)** — no reasoning level is requested from pi-ai, so the provider-specific reasoning field is omitted.
+- **None** — explicitly maps to the provider value `none`.
+- **Low / Medium / High** — asks pi-ai for the corresponding normalized thinking level.
 
-Leaving reasoning on **Provider default** is the safest compatibility option for generic OpenAI-compatible endpoints.
+pi-ai keeps thinking blocks separate from answer text. The plugin only renders `text` blocks; it never uses internal thinking/reasoning content as a completion fallback.
+
+If a model consumes its full output budget on thinking and returns no text, the plugin reports that condition and suggests using Provider default/None or increasing the token budget.
 
 ## Completion prompt templates
 
@@ -71,8 +72,6 @@ The settings page supports:
 - deleting a template
 - editing the full system prompt
 - resetting the current prompt to the built-in default
-
-Older saved `systemPrompt` settings are migrated into the default template automatically.
 
 Discussion uses a separate editable system prompt so chat-style instructions do not interfere with inline completion behavior.
 
@@ -105,6 +104,8 @@ The command palette exposes:
 - Test provider connection
 
 ## Development
+
+Requires Node 22.
 
 ```bash
 npm ci
