@@ -49,7 +49,9 @@ export interface DiscussionSidebarHost {
 
 export class DiscussionSidebarView extends ItemView {
   private rootEl: HTMLElement | null = null;
+  private titleEl: HTMLElement | null = null;
   private noteEl: HTMLElement | null = null;
+  private referenceLabelEl: HTMLElement | null = null;
   private referenceWrapEl: HTMLElement | null = null;
   private referenceEl: HTMLElement | null = null;
   private messagesEl: HTMLElement | null = null;
@@ -78,7 +80,8 @@ export class DiscussionSidebarView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "AI Discussion";
+    const language = this.host.getDiscussionSnapshot().language ?? "zh";
+    return tr(language, "AI 讨论", "AI Discussion");
   }
 
   getIcon(): string {
@@ -93,7 +96,9 @@ export class DiscussionSidebarView extends ItemView {
   async onClose(): Promise<void> {
     this.contentEl.empty();
     this.rootEl = null;
+    this.titleEl = null;
     this.noteEl = null;
+    this.referenceLabelEl = null;
     this.referenceWrapEl = null;
     this.referenceEl = null;
     this.messagesEl = null;
@@ -114,10 +119,18 @@ export class DiscussionSidebarView extends ItemView {
     if (!this.rootEl) return;
     const snapshot = this.host.getDiscussionSnapshot();
     const language = snapshot.language ?? "zh";
+    this.busy =
+      snapshot.status === "thinking" || snapshot.status === "generating";
 
+    if (this.titleEl) {
+      this.titleEl.textContent = tr(language, "AI 讨论", "AI Discussion");
+    }
     if (this.noteEl) {
       this.noteEl.textContent =
         snapshot.notePath ?? tr(language, "未绑定笔记", "No active note");
+    }
+    if (this.referenceLabelEl) {
+      this.referenceLabelEl.textContent = tr(language, "参考选文", "Reference");
     }
 
     if (this.newButtonEl) {
@@ -150,8 +163,6 @@ export class DiscussionSidebarView extends ItemView {
     this.renderStatus(snapshot, language);
     this.renderControls(snapshot, language);
 
-    this.busy =
-      snapshot.status === "thinking" || snapshot.status === "generating";
     if (this.sendButtonEl) {
       this.sendButtonEl.textContent = this.busy
         ? tr(language, "停止", "Stop")
@@ -189,7 +200,7 @@ export class DiscussionSidebarView extends ItemView {
       cls: "ai-autocomplete-sidebar-header",
     });
     const headerText = header.createDiv();
-    headerText.createDiv({
+    this.titleEl = headerText.createDiv({
       cls: "ai-autocomplete-sidebar-title",
       text: "AI Discussion",
     });
@@ -213,7 +224,7 @@ export class DiscussionSidebarView extends ItemView {
     const referenceHeader = referenceSection.createDiv({
       cls: "ai-autocomplete-reference-header",
     });
-    referenceHeader.createSpan({ text: "Reference" });
+    this.referenceLabelEl = referenceHeader.createSpan({ text: "Reference" });
 
     const referenceActions = referenceHeader.createDiv({
       cls: "ai-autocomplete-reference-actions",
