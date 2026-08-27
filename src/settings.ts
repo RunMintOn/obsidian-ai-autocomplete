@@ -2,7 +2,7 @@ import {
   DEFAULT_DISCUSSION_PROMPT,
   DEFAULT_SYSTEM_PROMPT,
   type ReasoningEffort,
-} from "./ai-client";
+} from "./ai-client.js";
 
 export type UiLanguage = "zh" | "en";
 
@@ -44,6 +44,8 @@ type LegacySettings = Partial<AIAutocompleteSettings> & {
 
 export const DEFAULT_API_BASE_URL = "https://api.openai.com/v1";
 export const DEFAULT_TEMPLATE_ID = "default";
+export const MIN_TOKEN_BUDGET = 16;
+export const MAX_TOKEN_BUDGET = 65536;
 
 export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
   uiLanguage: "zh",
@@ -61,13 +63,7 @@ export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
   discussionReasoningEffort: "",
   maxPrefixChars: 2400,
   maxSuffixChars: 600,
-  promptTemplates: [
-    {
-      id: DEFAULT_TEMPLATE_ID,
-      name: "默认",
-      prompt: DEFAULT_SYSTEM_PROMPT,
-    },
-  ],
+  promptTemplates: [createDefaultTemplate(DEFAULT_SYSTEM_PROMPT)],
   activePromptTemplateId: DEFAULT_TEMPLATE_ID,
   discussionPrompt: DEFAULT_DISCUSSION_PROMPT,
 };
@@ -75,23 +71,14 @@ export const DEFAULT_SETTINGS: AIAutocompleteSettings = {
 export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
   const loaded = (raw ?? {}) as LegacySettings;
   const legacyPrompt = loaded.systemPrompt?.trim();
-  const promptTemplates = normalizeTemplates(
-    loaded.promptTemplates,
-    legacyPrompt || DEFAULT_SYSTEM_PROMPT
+  const fallbackPrompt = legacyPrompt || DEFAULT_SYSTEM_PROMPT;
+  const promptTemplates = normalizeTemplates(loaded.promptTemplates, fallbackPrompt);
+  const activePromptTemplateId = resolveActiveTemplateId(
+    promptTemplates,
+    loaded.activePromptTemplateId
   );
-
-  const activePromptTemplateId = promptTemplates.some(
-    (template) => template.id === loaded.activePromptTemplateId
-  )
-    ? (loaded.activePromptTemplateId as string)
-    : promptTemplates[0].id;
-
   const baseUrl = loaded.baseUrl?.trim() || DEFAULT_API_BASE_URL;
-  const providerId =
-    loaded.providerId?.trim() ||
-    (normalizeUrl(baseUrl) === normalizeUrl(DEFAULT_API_BASE_URL)
-      ? "openai"
-      : "custom");
+  const providerId = resolveProviderId(loaded.providerId, baseUrl);
 
   const providerApiKeys = normalizeStringMap(loaded.providerApiKeys);
   const providerModels = {
@@ -99,11 +86,14 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
     ...normalizeStringMap(loaded.providerModels),
   };
 
-  if (loaded.apiKey?.trim() && !providerApiKeys[providerId]) {
-    providerApiKeys[providerId] = loaded.apiKey.trim();
+  const legacyApiKey = loaded.apiKey?.trim();
+  if (legacyApiKey && !providerApiKeys[providerId]) {
+    providerApiKeys[providerId] = legacyApiKey;
   }
-  if (loaded.model?.trim() && !providerModels[providerId]) {
-    providerModels[providerId] = loaded.model.trim();
+
+  const legacyModel = loaded.model?.trim();
+  if (legacyModel && !providerModels[providerId]) {
+    providerModels[providerId] = legacyModel;
   }
 
   const discussionProviderModels = {
@@ -112,7 +102,7 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
   };
 
   return {
-    uiLanguage: loaded.uiLanguage === "en" ? "en" : "zh",
+    uiLanguage: normalizeUiLanguage(loaded.uiLanguage),
     autoEnabled: loaded.autoEnabled ?? loaded.enabled ?? DEFAULT_SETTINGS.autoEnabled,
     eagerness: normalizeEagerness(loaded.eagerness ?? DEFAULT_SETTINGS.eagerness),
     providerId,
@@ -120,10 +110,7 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
     providerModels,
     discussionProviderModels,
     baseUrl,
-    temperature:
-      typeof loaded.temperature === "number"
-        ? loaded.temperature
-        : DEFAULT_SETTINGS.temperature,
+    temperature: numberOrDefault(loaded.temperature, DEFAULT_SETTINGS.temperature),
     maxTokens: normalizeTokenBudget(loaded.maxTokens, DEFAULT_SETTINGS.maxTokens),
     discussionMaxTokens: normalizeTokenBudget(
       loaded.discussionMaxTokens,
@@ -135,14 +122,14 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
     discussionReasoningEffort: normalizeReasoningEffort(
       loaded.discussionReasoningEffort
     ),
-    maxPrefixChars:
-      typeof loaded.maxPrefixChars === "number"
-        ? loaded.maxPrefixChars
-        : DEFAULT_SETTINGS.maxPrefixChars,
-    maxSuffixChars:
-      typeof loaded.maxSuffixChars === "number"
-        ? loaded.maxSuffixChars
-        : DEFAULT_SETTINGS.maxSuffixChars,
+    maxPrefixChars: numberOrDefault(
+      loaded.maxPrefixChars,
+      DEFAULT_SETTINGS.maxPrefixChars
+    ),
+    maxSuffixChars: numberOrDefault(
+      loaded.maxSuffixChars,
+      DEFAULT_SETTINGS.maxSuffixChars
+    ),
     promptTemplates,
     activePromptTemplateId,
     discussionPrompt: migrateDiscussionPrompt(loaded.discussionPrompt),
@@ -152,11 +139,10 @@ export function normalizeLoadedSettings(raw: unknown): AIAutocompleteSettings {
 export function getActivePromptTemplate(
   settings: AIAutocompleteSettings
 ): PromptTemplate {
-  return (
-    settings.promptTemplates.find(
-      (template) => template.id === settings.activePromptTemplateId
-    ) ?? settings.promptTemplates[0]
+  const activeTemplate = settings.promptTemplates.find(
+    (template) => template.id === settings.activePromptTemplateId
   );
+  return activeTemplate ?? settings.promptTemplates[0];
 }
 
 export function getProviderApiKey(settings: AIAutocompleteSettings): string {
@@ -173,7 +159,6 @@ export function setProviderApiKey(
   };
 }
 
-/** Completion model for the active provider. */
 export function getProviderModel(settings: AIAutocompleteSettings): string {
   return settings.providerModels[settings.providerId] ?? "";
 }
@@ -188,7 +173,6 @@ export function setProviderModel(
   };
 }
 
-/** Discussion model is intentionally separate from inline completion. */
 export function getDiscussionProviderModel(
   settings: AIAutocompleteSettings
 ): string {
@@ -213,13 +197,17 @@ export function normalizeEagerness(value: number): number {
 }
 
 export function normalizeReasoningEffort(value: unknown): ReasoningEffort {
-  if (value === "none") return "minimal"; // migrate the old ambiguous label
-  return value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high"
-    ? value
-    : "";
+  switch (value) {
+    case "none":
+      return "minimal";
+    case "minimal":
+    case "low":
+    case "medium":
+    case "high":
+      return value;
+    default:
+      return "";
+  }
 }
 
 export function normalizeTokenBudget(
@@ -228,7 +216,10 @@ export function normalizeTokenBudget(
 ): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(65536, Math.max(16, Math.round(parsed)));
+  return Math.min(
+    MAX_TOKEN_BUDGET,
+    Math.max(MIN_TOKEN_BUDGET, Math.round(parsed))
+  );
 }
 
 export function createTemplateId(): string {
@@ -247,49 +238,82 @@ export function uniqueTemplateName(
   return `${preferredName} ${index}`;
 }
 
+function normalizeUiLanguage(value: UiLanguage | undefined): UiLanguage {
+  if (value === "en") return "en";
+  return "zh";
+}
+
+function numberOrDefault(value: unknown, fallback: number): number {
+  if (typeof value === "number") return value;
+  return fallback;
+}
+
+function resolveActiveTemplateId(
+  templates: PromptTemplate[],
+  requestedId: string | undefined
+): string {
+  if (requestedId && templates.some((template) => template.id === requestedId)) {
+    return requestedId;
+  }
+  return templates[0].id;
+}
+
+function resolveProviderId(
+  configuredProviderId: string | undefined,
+  baseUrl: string
+): string {
+  const providerId = configuredProviderId?.trim();
+  if (providerId) return providerId;
+
+  if (normalizeUrl(baseUrl) === normalizeUrl(DEFAULT_API_BASE_URL)) {
+    return "openai";
+  }
+  return "custom";
+}
+
 function normalizeTemplates(
   templates: PromptTemplate[] | undefined,
   fallbackPrompt: string
 ): PromptTemplate[] {
   if (!Array.isArray(templates) || templates.length === 0) {
-    return [
-      {
-        id: DEFAULT_TEMPLATE_ID,
-        name: "默认",
-        prompt: migrateCompletionPrompt(fallbackPrompt),
-      },
-    ];
+    return [createDefaultTemplate(fallbackPrompt)];
   }
 
-  const valid = templates
-    .filter(
-      (template) =>
-        template &&
-        typeof template.id === "string" &&
-        typeof template.name === "string" &&
-        typeof template.prompt === "string"
-    )
-    .map((template) => ({
-      ...template,
-      name:
-        template.id === DEFAULT_TEMPLATE_ID && template.name === "Default"
-          ? "默认"
-          : template.name,
-      prompt:
-        template.id === DEFAULT_TEMPLATE_ID
-          ? migrateCompletionPrompt(template.prompt)
-          : template.prompt,
-    }));
+  const validTemplates: PromptTemplate[] = [];
+  for (const template of templates) {
+    if (!isPromptTemplate(template)) continue;
 
-  return valid.length > 0
-    ? valid
-    : [
-        {
-          id: DEFAULT_TEMPLATE_ID,
-          name: "默认",
-          prompt: migrateCompletionPrompt(fallbackPrompt),
-        },
-      ];
+    let name = template.name;
+    let prompt = template.prompt;
+    if (template.id === DEFAULT_TEMPLATE_ID) {
+      if (name === "Default") name = "默认";
+      prompt = migrateCompletionPrompt(prompt);
+    }
+
+    validTemplates.push({ ...template, name, prompt });
+  }
+
+  if (validTemplates.length === 0) {
+    return [createDefaultTemplate(fallbackPrompt)];
+  }
+  return validTemplates;
+}
+
+function isPromptTemplate(template: PromptTemplate | null | undefined): boolean {
+  return Boolean(
+    template &&
+      typeof template.id === "string" &&
+      typeof template.name === "string" &&
+      typeof template.prompt === "string"
+  );
+}
+
+function createDefaultTemplate(prompt: string): PromptTemplate {
+  return {
+    id: DEFAULT_TEMPLATE_ID,
+    name: "默认",
+    prompt: migrateCompletionPrompt(prompt),
+  };
 }
 
 function migrateCompletionPrompt(prompt: string): string {
@@ -305,16 +329,19 @@ function migrateCompletionPrompt(prompt: string): string {
 }
 
 function migrateDiscussionPrompt(prompt: string | undefined): string {
-  const trimmed = prompt?.trim() ?? "";
+  if (prompt === undefined) return DEFAULT_DISCUSSION_PROMPT;
+
+  const trimmed = prompt.trim();
   if (!trimmed) return DEFAULT_DISCUSSION_PROMPT;
   if (trimmed.startsWith("You are a concise thinking partner inside Obsidian.")) {
     return DEFAULT_DISCUSSION_PROMPT;
   }
-  return prompt as string;
+  return prompt;
 }
 
 function normalizeStringMap(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
   const output: Record<string, string> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (typeof entry === "string") output[key] = entry;
