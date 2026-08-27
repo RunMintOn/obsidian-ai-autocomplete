@@ -33,11 +33,15 @@ export interface CompletionContext {
 }
 
 export interface InlineSuggestionConfig {
-  enabled: boolean;
-  delay: number;
-  minPrefixChars: number;
+  autoEnabled: boolean;
+  eagerness: number;
   maxPrefixChars: number;
   maxSuffixChars: number;
+}
+
+interface TriggerPolicy {
+  delay: number;
+  minPrefixChars: number;
 }
 
 export type FetchFn = (context: CompletionContext) => Promise<string | null>;
@@ -213,6 +217,23 @@ function nextSegmentLength(text: string): number {
   return leadingWhitespace + fallback.length;
 }
 
+function triggerPolicy(eagerness: number): TriggerPolicy {
+  const level = Math.min(5, Math.max(1, Math.round(eagerness)));
+  switch (level) {
+    case 1:
+      return { delay: 1200, minPrefixChars: 12 };
+    case 2:
+      return { delay: 900, minPrefixChars: 8 };
+    case 4:
+      return { delay: 450, minPrefixChars: 2 };
+    case 5:
+      return { delay: 280, minPrefixChars: 1 };
+    case 3:
+    default:
+      return { delay: 650, minPrefixChars: 4 };
+  }
+}
+
 const managers = new WeakMap<EditorView, SuggestionManager>();
 const activeManagers = new Set<SuggestionManager>();
 
@@ -273,7 +294,7 @@ export class SuggestionManager {
         return;
       }
 
-      if (this.getConfig().enabled) this.schedule();
+      if (this.getConfig().autoEnabled) this.schedule();
       return;
     }
 
@@ -325,8 +346,6 @@ export class SuggestionManager {
     const snapshot = this.compositionSnapshot;
     this.compositionSnapshot = null;
 
-    if (!this.getConfig().enabled) return;
-
     if (snapshot) {
       const doc = this.view.state.doc.toString();
       const { before, after, suggestion } = snapshot;
@@ -351,21 +370,25 @@ export class SuggestionManager {
       }
     }
 
-    if (this.getConfig().enabled) this.schedule();
+    if (this.getConfig().autoEnabled) this.schedule();
   }
 
   schedule(): void {
     this.cancelTimer();
-    const delay = Math.max(0, this.getConfig().delay);
+    const config = this.getConfig();
+    if (!config.autoEnabled) return;
+    const delay = triggerPolicy(config.eagerness).delay;
     this.timer = window.setTimeout(() => {
       this.timer = null;
-      void this.request();
+      void this.request(false);
     }, delay);
   }
 
-  async request(): Promise<void> {
+  async request(manual = false): Promise<void> {
     const config = this.getConfig();
-    if (!config.enabled || this.composing || this.view.composing) return;
+    if ((!manual && !config.autoEnabled) || this.composing || this.view.composing) {
+      return;
+    }
     if (currentSuggestion(this.view)) return;
 
     const selection = this.view.state.selection.main;
@@ -382,8 +405,14 @@ export class SuggestionManager {
       Math.min(doc.length, cursor + config.maxSuffixChars)
     );
 
-    if (prefix.trim().length < config.minPrefixChars) return;
+    if (manual) {
+      if (!prefix.trim() && !suffix.trim()) return;
+    } else {
+      const policy = triggerPolicy(config.eagerness);
+      if (prefix.trim().length < policy.minPrefixChars) return;
+    }
 
+    this.cancelTimer();
     this.abortRequest();
     const controller = new AbortController();
     this.controller = controller;
@@ -397,7 +426,7 @@ export class SuggestionManager {
       });
 
       if (controller.signal.aborted || !result || !result.trim()) return;
-      if (!this.getConfig().enabled) return;
+      if (!manual && !this.getConfig().autoEnabled) return;
       if (this.view.state.doc !== doc) return;
 
       const currentSelection = this.view.state.selection.main;
