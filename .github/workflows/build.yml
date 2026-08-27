@@ -18,3 +18,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Prepare Obsidian plugin artifact
+        run: |
+          mkdir -p dist/ai-autocomplete
+          cp main.js manifest.json styles.css dist/ai-autocomplete/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-autocomplete-dev
+          path: dist/ai-autocomplete
